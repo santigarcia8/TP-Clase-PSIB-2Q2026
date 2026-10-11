@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 
-VIDEO_PATH = r"D:\video_ojo_oli.mp4"   # cambiá por tu video
+VIDEO_PATH = r"C:\Users\agust\Downloads\VideoOli.mp4" # cambiá por tu video
 FRAME_IDX = 0                    # frame que querés usar
 
 # 1) Leer un frame del video
