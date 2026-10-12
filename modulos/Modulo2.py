@@ -3,185 +3,223 @@
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-
-VIDEO_PATH = r"C:\Users\agust\Downloads\VideoOli.mp4" # cambiá por tu video
-FRAME_IDX = 0                    # frame que querés usar
-
-# 1) Leer un frame del video
-TIEMPO_S = 11.0   # segundo que querés usar
-
-cap = cv2.VideoCapture(VIDEO_PATH)
-cap.set(cv2.CAP_PROP_POS_MSEC, TIEMPO_S * 1000)   # va en milisegundos
-ok, frame_bgr = cap.read()
-cap.release()
-assert ok, "No se pudo leer el frame, revisá VIDEO_PATH o TIEMPO_S"
-
-# 2) Elegir la ROI con el mouse (arrastrá un rectángulo alrededor del ojo y Enter)
-x, y, w, h = cv2.selectROI("Elegí la ROI", frame_bgr)
-cv2.destroyAllWindows()
-roi_bgr = frame_bgr[y:y+h, x:x+w]
-
-# 3) Pasar a gris y suavizar
-gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
-# 4) Otsu (INV: la pupila es oscura, así queda en blanco = 255)
-umbral, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-umbral = 40
-print(f"Umbral de Otsu: {umbral}")
-
-# 5) Visualizar
-fig, ax = plt.subplots(1, 4, figsize=(16, 4))
-ax[0].imshow(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)); ax[0].set_title("ROI")
-ax[1].imshow(blur, cmap="gray"); ax[1].set_title("Gris + blur")
-ax[2].hist(blur.ravel(), bins=256); ax[2].axvline(umbral, color="r"); ax[2].set_title("Histograma + umbral")
-ax[3].imshow(mask, cmap="gray"); ax[3].set_title("Máscara Otsu")
-for a in (ax[0], ax[1], ax[3]): a.axis("off")
-plt.show()
-
-#K means
-
-cv2.setRNGSeed(0)   # para que los resultados sean reproducibles
-
-# 1) Pasar a Lab y suavizar un poco
-lab = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2LAB)
-lab = cv2.GaussianBlur(lab, (5, 5), 0)
-
-# 2) Armar la matriz de datos: una fila por píxel, 3 columnas (L, a, b)
-datos = lab.reshape(-1, 3).astype(np.float32)
-
-# 3) Correr K-Means para cada K
-criterio = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 50, 0.5)
-fig, ax = plt.subplots(2, 4, figsize=(16, 7))
-
-for i, K in enumerate([2, 3, 4, 5]):
-    _, etiquetas, centros = cv2.kmeans(datos, K, None, criterio, 10, cv2.KMEANS_PP_CENTERS)
-    etiquetas = etiquetas.reshape(roi_bgr.shape[:2])
-
-    # El cluster de la pupila es el de menor L (el más oscuro)
-    k_pupila = np.argmin(centros[:, 0])
-    mask_k = (etiquetas == k_pupila).astype(np.uint8) * 255
-
-    ax[0, i].imshow(etiquetas, cmap="viridis"); ax[0, i].set_title(f"Clusters K={K}")
-    ax[1, i].imshow(mask_k, cmap="gray");       ax[1, i].set_title(f"Máscara pupila K={K}")
-    ax[0, i].axis("off"); ax[1, i].axis("off")
-
-plt.tight_layout()
-plt.show()
-
-#Snakes
-
-# --- Elegir el blob de la pupila a partir de K-Means (K=4) ---
-K = 4
-_, etiquetas, centros = cv2.kmeans(datos, K, None, criterio, 10, cv2.KMEANS_PP_CENTERS)
-etiquetas = etiquetas.reshape(roi_bgr.shape[:2])
-k_pupila = np.argmin(centros[:, 0])
-mask_k = (etiquetas == k_pupila).astype(np.uint8) * 255
-
-n, lab_cc, stats, cents = cv2.connectedComponentsWithStats(mask_k)
-h, w = mask_k.shape
-centro_roi = np.array([w / 2, h / 2])
-
-mejor, mejor_score = None, -1
-for i in range(1, n):
-    area = stats[i, cv2.CC_STAT_AREA]
-    dist = np.linalg.norm(cents[i] - centro_roi)
-    score = area / (1 + dist)
-    if score > mejor_score:
-        mejor, mejor_score = i, score
-
-mask_pupila = (lab_cc == mejor).astype(np.uint8) * 255
-
 from skimage.segmentation import active_contour
 from skimage.filters import gaussian
-
-# 1) Sacar el reflejo del flash (píxeles muy brillantes) para que no engañe a la snake
-gris = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-flash = (gris > 200).astype(np.uint8) * 255
-flash = cv2.dilate(flash, np.ones((5, 5), np.uint8))
-gris_sin_flash = cv2.inpaint(gris, flash, 3, cv2.INPAINT_TELEA)
-
-# 2) Suavizar y normalizar a [0, 1]
-img = gaussian(gris_sin_flash, sigma=2, preserve_range=True) / 255.0
-
-# 3) Contorno inicial: un círculo alrededor de la pupila
-M = cv2.moments(mask_pupila)
-cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
-radio_pupila = np.sqrt(mask_pupila.astype(bool).sum() / np.pi)
-radio_ini = radio_pupila * 1.5      # un poco más grande que la pupila
-
-t = np.linspace(0, 2 * np.pi, 200)
-init = np.column_stack([cy + radio_ini * np.sin(t),    # fila (y)
-                        cx + radio_ini * np.cos(t)])   # columna (x)
-
-# 4) Correr la snake
-snake = active_contour(img, init,
-                       alpha=0.015,    # elasticidad: más alto = se contrae más
-                       beta=10,        # rigidez: más alto = más suave/redonda
-                       gamma=0.001,    # tamaño del paso
-                       w_line=0,
-                       w_edge=1,       # atracción a bordes
-                       max_num_iter=2500)
-
-# 5) Máscara binaria a partir de la snake (para usarla después en Dice/IoU)
-pts = np.round(snake[:, ::-1]).astype(np.int32)   # (fila, col) -> (x, y) para OpenCV
-mask_snake = np.zeros_like(mask_pupila)
-cv2.fillPoly(mask_snake, [pts], 255)
-
-# 6) Visualizar
-fig, ax = plt.subplots(1, 3, figsize=(14, 5))
-ax[0].imshow(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB))
-ax[0].plot(init[:, 1], init[:, 0], "--r", lw=1.5)
-ax[0].set_title("Contorno inicial (rojo)")
-ax[1].imshow(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB))
-ax[1].plot(snake[:, 1], snake[:, 0], "-g", lw=2)
-ax[1].set_title("Contorno final (verde)")
-ax[2].imshow(mask_snake, cmap="gray"); ax[2].set_title("Máscara de la snake")
-for a in ax: a.axis("off")
-plt.show()
-
-#Watershed
-
 from skimage.segmentation import watershed
 from skimage.filters import sobel
 
-# 1) Sacar el flash (igual que en la snake; lo repetimos para no depender de otro bloque)
-gris = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-flash = (gris > 200).astype(np.uint8) * 255
-flash = cv2.dilate(flash, np.ones((5, 5), np.uint8))
-gris_sin_flash = cv2.inpaint(gris, flash, 3, cv2.INPAINT_TELEA)
+def lectura_frame(video_path, num_frame=0, roi_coords=None):
+    cap = cv2.VideoCapture(video_path) #abre el archivo desde el path dado
+    cap.set(cv2.CAP_PROP_POS_FRAMES, num_frame) #define el frame seleccionado por el usuario dentro de los del video
+    ok, frame_bgr = cap.read()  #devuelve un array donde cada posición tiene tres números: BGR por convención de CV2
+    cap.release()
+    assert ok, f"No se pudo leer el frame {num_frame}, revisá video_path" #hago un STOP que si da error ok, NO pueda seguir
+    
+    frame_rgb=cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) #reordena los colores de BGR a RGB para el procesamiento
+    
+    if roi_coords is not None:
+        ymin, ymax, xmin, xmax = roi_coords #como yo le doy roi_coords, separo esa info en las cuatro coordenadas concretas
+        roi_rgb = frame_rgb[ymin:ymax, xmin:xmax] #toma los píxeles que hay entre las 4 coordenadas
+    else:
+        roi_rgb = frame_rgb
+        
+    return frame_rgb, roi_rgb
 
-# 2) Imagen de gradiente (el "relieve")
-suave = cv2.GaussianBlur(gris_sin_flash, (5, 5), 0)
-gradiente = sobel(suave.astype(float) / 255.0)
+def otsu(roi_rgb):
+    #Para hacer el cálculo con Otsu, necesito la imagen en escala de grises para poder umbralizar. Por eso gamma todo a esos valores
+    grises = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY) #función que pasa de rgb a grises
+    
+    umbral, mascara = cv2.threshold(grises, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU) #uso la función que devuelve la máscara de Otsu y el valor del umbral que separa al histograma
+    print(f"Umbral de Otsu: {umbral}")
 
-# 3) Marcadores, con tamaños relativos al tamaño de la pupila
-radio = np.sqrt((mask_pupila > 0).sum() / np.pi)
-r_chico = max(1, int(0.3 * radio))
-r_grande = max(2, int(0.6 * radio))
-k_chico = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_chico + 1, 2 * r_chico + 1))
-k_grande = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_grande + 1, 2 * r_grande + 1))
+    fig, ax = plt.subplots(1, 4, figsize=(16, 4))
+    ax[0].imshow(roi_rgb); ax[0].set_title("ROI") #visualizo la ROI original en color
+    ax[1].imshow(grises, cmap="gray"); ax[1].set_title("ROI en escala de grises") #visualizo la ROI original en gris
+    ax[2].hist(grises.ravel(), bins=256); ax[2].axvline(umbral, color="r"); ax[2].set_title("Histograma + umbral") #grafio el histograma con el umbral calculado
+    ax[3].imshow(mascara, cmap="gray"); ax[3].set_title("Máscara Otsu") #visualizo la máscara final donde se suone que la pupila queda blanca y el iris negro
+    for a in (ax[0], ax[1], ax[3]): a.axis("off")
+    plt.show()
+    
+    return mascara, umbral
 
-seguro_pupila = cv2.erode(mask_pupila, k_chico)
-zona_dudosa = cv2.dilate(mask_pupila, k_grande)
+def kmeans(roi_rgb):
+    cv2.setRNGSeed(0)   #pongo la misma semilla siempre en 0 para no tener problema si se runnea más de una vez el código de forma seguida
 
-marcadores = np.zeros(gris.shape, dtype=np.int32)
-marcadores[zona_dudosa == 0] = 1       # 1 = fondo seguro
-marcadores[seguro_pupila > 0] = 2      # 2 = pupila segura
+    #como tengo que separar por croma e intensidad, separo en L (brillo) A/B (croma)
+    lab = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2LAB) #función nativa que transforma los números de cada píxel de RGB a LAB
 
-# 4) Inundación
-etiquetas_ws = watershed(gradiente, marcadores)
-mask_ws = (etiquetas_ws == 2).astype(np.uint8) * 255
+    datos = lab.reshape(-1, 3).astype(np.float32) #reestrcturo. es una matriz de la cantidad de filas de píxeles de la ROI, y tres columnas: L, A y B
 
-# 5) Visualizar
-fig, ax = plt.subplots(1, 4, figsize=(16, 4))
-ax[0].imshow(gradiente, cmap="gray");  ax[0].set_title("Gradiente (relieve)")
-ax[1].imshow(marcadores, cmap="viridis"); ax[1].set_title("Marcadores")
-ax[2].imshow(mask_ws, cmap="gray");    ax[2].set_title("Máscara Watershed")
-ax[3].imshow(cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB))
-ax[3].contour(mask_ws, colors="lime", linewidths=1)
-ax[3].set_title("Contorno sobre la ROI")
-for a in ax: a.axis("off")
-plt.show()
+    criterio = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.1) #defino un criterio de cuándo el algoritmo para. digo que pare luego de 100 iteraciones o cuando los centroides de cada grupo se muevan menos de 0.1 entre iteraaciones
+    
+    fig, ax = plt.subplots(2, 4, figsize=(16, 7))
+    mascaras = {}
 
-#Modulo 2.2: Morfologia matematica para limpieza de mascara
+    for i, K in enumerate([2, 3, 4, 5]): #le deino un vector con los 4 Ks a probar (grupos en los que se separará)
+        _, etiquetas, centros = cv2.kmeans(datos, K, None, criterio, 10, cv2.KMEANS_PP_CENTERS) #función de CV2 que le gamma la matriz LAB, el valor de K a separar, el criterio a usar y le pido que con KMEANS_PP_CENTRES elija bien los centros para que sean aleatorios pero NO queden muy juntos. quiero que estén separados para que no ponga cercanos valores de pupila o riis que definitivamente son distintos
+        etiquetas = etiquetas.reshape(roi_rgb.shape[:2]) #define a qué grupo pertenece cada píxel
+
+        #separo por intesidad (L), por lo que tengo que ordenarlos y elegir el mínimo para poder distinguirlos por ese brillo
+        k_pupila = np.argmin(centros[:, 0])
+        mask_k = (etiquetas == k_pupila).astype(np.uint8) * 255 #arma la máscara para ir multiplicando y ponendo los píxeles en cada grupo
+        mascaras[K] = mask_k
+        #hago las filas y columnas con los distintos grupos
+        ax[0, i].imshow(etiquetas, cmap="viridis"); ax[0, i].set_title(f"Clusters K={K}")
+        ax[1, i].imshow(mask_k, cmap="gray");       ax[1, i].set_title(f"Máscara pupila K={K}")
+        ax[0, i].axis("off"); ax[1, i].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+    
+    return mascaras
+
+def snakes(roi_rgb):
+    lab = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2LAB)
+    
+    datos = lab.reshape(-1, 3).astype(np.float32)
+    criterio = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.1)
+    
+    #quiero definir una badna inicial aproximada a la pupila, por eso elijo el Kmeans de 4 pra tener una región aproximada
+    K = 4
+    _, etiquetas, centros = cv2.kmeans(datos, K, None, criterio, 10, cv2.KMEANS_PP_CENTERS)
+    etiquetas = etiquetas.reshape(roi_rgb.shape[:2])
+    k_pupila = np.argmin(centros[:, 0])
+    mask_k = (etiquetas == k_pupila).astype(np.uint8) * 255
+    #Una vez que hice todo el kmeans de 4, le calculo para usar la snake
+
+    n, lab_cc, stats, cents = cv2.connectedComponentsWithStats(mask_k)
+    #lo que hace esta funcion es fijarse "manchas" que tiene la máscara. Yo quiero quedarme solo con la pupila para que el snake vaya por ella, entonces al tener la mascara binaria, tomo el fondo (0) como la mancha 0, y después
+    #donde haya otros números, son manchas aisladas. Con esas "zonas"/"manchas", defino su área teniendo en cuenta bordes y los píxeles dentro, y me fijo la más grande que debería ser la pupila. De esta forma, me aseguro de tomar el centro de ella
+    #para la snake y no otras "manchas" como podrían ser el flash reflejado u pestañas en el medio, etc.
+    h, w = mask_k.shape #defino el tamaño de la matriz para poder ver los centros
+    centro_roi = np.array([w / 2, h / 2])
+
+    #ahora hace el puntaje de cada una de las zonas para ver cuál es la mejor (pupila)
+    mejor, mejor_score = None, -1
+    for i in range(1, n):
+        area = stats[i, cv2.CC_STAT_AREA] #calcula el área de cada mancha
+        dist = np.linalg.norm(cents[i] - centro_roi)
+        score = area / (1 + dist) #el puntaje depende de qué tn grande sea la zona y qué tan cerca del centro. se spupone qe la pupila es el centro de la ROI total entonces la distancia sería chica
+        if score > mejor_score:
+            mejor, mejor_score = i, score
+
+    mask_pupila = (lab_cc == mejor).astype(np.uint8) * 255 #defino entonces la máscara según el mejor puntaje
+
+    #un relfejo de flash en la pupila podría hacer que la snake tome ese punto cuando no. Entonces lo suavizo
+    gris = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY) #gamma todo a escala de grises
+    flash = (gris > 200).astype(np.uint8) * 255 #me fijo donde la intesndiad superar a 200 que sería muy blanco como el flash
+    flash = cv2.dilate(flash, np.ones((5, 5), np.uint8))
+    gris_sin_flash = cv2.inpaint(gris, flash, 3, cv2.INPAINT_TELEA) #relleno esa zona blanca con los valores de píxeles vecinos para "borrar" y "llenar" ese lugar
+
+    #llevo todo a normalización para que la snake vea bien los bordes 
+    img = gaussian(gris_sin_flash, sigma=2, preserve_range=True) / 255.0
+
+    #defino la snake
+    M = cv2.moments(mask_pupila) #esta función da números de la forma del snake
+    cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"] #calculo el promedio de esos números que sería el centro
+    radio_pupila = np.sqrt(mask_pupila.astype(bool).sum() / np.pi) #defino el radio
+    radio_ini = radio_pupila * 1.5  #lo multiplico por 1.5 para que esté por fuera de la pupila y se vaya achicando en las iteraciones
+
+    t = np.linspace(0, 2 * np.pi, 200) #armo el vector de los ángulos de ese ciruclo de la snake de 200 puntos
+    init = np.column_stack([cy + radio_ini * np.sin(t),    
+        cx + radio_ini * np.cos(t)])  #uso las coordenadas radiales para definir la snake con los valores de los ángulos 
+
+    #defino los parámetros de elastcidad y beta para que se vaya cerrando la snake
+    snake = active_contour(img, init,
+        alpha=0.015,    #elasticidad
+        beta=10,       #rigidez
+        gamma=0.001,    #paso
+        w_line=0,
+        w_edge=1,       
+        max_num_iter=2500)
+
+    # Armo máscara binaria a partir de la snake (para usarla después en Dice/IoU) --> pongo el interior (pupila) blanco y el exterior negro
+    pts = np.round(snake[:, ::-1]).astype(np.int32)  
+    mask_snake = np.zeros_like(mask_pupila)
+    cv2.fillPoly(mask_snake, [pts], 255)
+
+    fig, ax = plt.subplots(1, 3, figsize=(14, 5))
+    ax[0].imshow(roi_rgb) #pongo la imagen en color con la snake inicial sobre ella
+    ax[0].plot(init[:, 1], init[:, 0], "--r", lw=1.5)
+    ax[0].set_title("Contorno inicial (rojo)")
+    ax[1].imshow(roi_rgb)
+    ax[1].plot(snake[:, 1], snake[:, 0], "-g", lw=2)
+    ax[1].set_title("Contorno final (verde)") #pongo la snake final con la imagen 
+    ax[2].imshow(mask_snake, cmap="gray"); ax[2].set_title("Máscara de la snake") #lo pongo en byn
+    for a in ax: a.axis("off")
+    plt.show()
+    
+    return mask_snake, mask_pupila
+
+def watershed_pupila(roi_rgb, mask_pupila):
+    #saco el flash otra vez para no tener problemas
+    gris = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
+    flash = (gris > 200).astype(np.uint8) * 255
+    flash = cv2.dilate(flash, np.ones((5, 5), np.uint8))
+    gris_sin_flash = cv2.inpaint(gris, flash, 3, cv2.INPAINT_TELEA)
+
+
+    gradiente = sobel(gris_sin_flash.astype(float) / 255.0) #aplico un filtro sobel para calcular gradiente y ver donde están los bordes
+
+    
+    radio = np.sqrt((mask_pupila > 0).sum() / np.pi) #se fija el radio de la pupila con la mascara que saque del snake, es la misma
+    # Centro de la pupila
+    M = cv2.moments(mask_pupila)
+    cx, cy = M["m10"] / M["m00"], M["m01"] / M["m00"]
+
+
+    marcadores = np.ones(gris.shape, dtype=np.int32) #hago una matriz toda de unos paa despues ir discriminando entre pupila o NO pupila
+    cv2.circle(marcadores, (int(cx), int(cy)), int(1.5 * radio), 0, -1) #defino un círculo un poco más grande de la pupila
+    cv2.circle(marcadores, (int(cx), int(cy)), int(0.5 * radio), 2, -1) #defino otro círculo un poco más chico que la pupila
+
+    #se supone que en la zona que entran esos dos dos círculos, es seguro pupila así que asigna 2. Entre medio, pone 0 porque es lo que watershed definirá. Fuera del grande es 1 porque no es pupila
+
+
+    etiquetas_ws = watershed(gradiente, marcadores) #la función va "llenando" las zonas donde tiene que decidir si es pupila o no. recibe el gradiente (indica los picos) y marcadores (donde hay 2, 1 y 0)
+    mask_ws = (etiquetas_ws == 2).astype(np.uint8) * 255 #define las etiquetas con la máscara donde hay 2 que es pupila. ya no hay mas 0 porque definió el algoritmo
+
+    #plotting
+    fig, ax = plt.subplots(1, 4, figsize=(16, 4))
+    ax[0].imshow(gradiente, cmap="gray");  ax[0].set_title("Gradiente (relieve)")
+    ax[1].imshow(marcadores, cmap="viridis"); ax[1].set_title("Marcadores")
+    ax[2].imshow(mask_ws, cmap="gray");    ax[2].set_title("Máscara Watershed")
+    ax[3].imshow(roi_rgb)
+    ax[3].contour(mask_ws, colors="lime", linewidths=1)
+    ax[3].set_title("Contorno sobre la ROI")
+    for a in ax: a.axis("off")
+    plt.show()
+    
+    return mask_ws
+    
+    
+
+    
+
+def ejecutar_modulo_2(config):
+
+    print("   EJECUTANDO MÓDULO 2: SEGMENTACIÓN Y MORFOLOGÍA DE LA PUPILA ")
+    # Extrae parámetros del diccionario global del main
+    video_path = config['video_path']
+    roi = config['roi']
+    frame_idx = config.get('frame_idx', 0)
+    
+    frame_rgb, roi_rgb = lectura_frame(video_path=video_path,num_frame=frame_idx, roi_coords=roi) #lep gamma los datos para que devuelva la ROI y frame
+
+    print("Ejecutando segmentación por Otsu")
+    
+    mascara_otsu, umbral_otsu = otsu(roi_rgb)
+
+    print("Ejecutando segmentación por K-Means")
+    
+    mascaras_kmeans = kmeans(roi_rgb=roi_rgb)
+
+    print("Ejecutando segmentación por Contornos activos (snakes)")
+    
+    mask_snake, mask_pupila = snakes(roi_rgb)
+    
+    print("Ejecutando segmentación por Watershed")
+    
+    mask_ws = watershed_pupila(roi_rgb, mask_pupila)
+
+    
+    #Modulo 2.2: Morfologia matematica para limpieza de mascara

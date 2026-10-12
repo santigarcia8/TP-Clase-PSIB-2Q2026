@@ -162,7 +162,7 @@ def main():
         if opcion == "1":
             Modulo1.ejecutar_modulo_1(config)  # Llama a la función 'ejecutar' del Módulo 1 y asi sucesivamente para cada modulo
         elif opcion == "2":
-            print("[INFO] El Módulo 2 se implementará en la siguiente etapa.")
+            Modulo2.ejecutar_modulo_2(config) 
         elif opcion == "3":
             print("[INFO] El Módulo 3 se implementará en la siguiente etapa.")
         elif opcion == "4":
