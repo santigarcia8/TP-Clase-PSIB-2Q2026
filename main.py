@@ -164,7 +164,7 @@ def main():
         elif opcion == "2":
             Modulo2.ejecutar_modulo_2(config) 
         elif opcion == "3":
-            print("[INFO] El Módulo 3 se implementará en la siguiente etapa.")
+            Modulo3.ejecutar_modulo_3(config)
         elif opcion == "4":
             Modulo4.ejecutar_modulo_4(config)
         elif opcion == "5":
