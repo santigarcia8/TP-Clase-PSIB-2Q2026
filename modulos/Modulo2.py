@@ -105,14 +105,10 @@ def snakes(roi_rgb):
 
     mask_pupila = (lab_cc == mejor).astype(np.uint8) * 255 #defino entonces la máscara según el mejor puntaje
 
-    #un relfejo de flash en la pupila podría hacer que la snake tome ese punto cuando no. Entonces lo suavizo
     gris = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY) #gamma todo a escala de grises
-    flash = (gris > 200).astype(np.uint8) * 255 #me fijo donde la intesndiad superar a 200 que sería muy blanco como el flash
-    flash = cv2.dilate(flash, np.ones((5, 5), np.uint8))
-    gris_sin_flash = cv2.inpaint(gris, flash, 3, cv2.INPAINT_TELEA) #relleno esa zona blanca con los valores de píxeles vecinos para "borrar" y "llenar" ese lugar
 
     #llevo todo a normalización para que la snake vea bien los bordes 
-    img = gaussian(gris_sin_flash, sigma=2, preserve_range=True) / 255.0
+    img = gaussian(gris, sigma=2, preserve_range=True) / 255.0
 
     #defino la snake
     M = cv2.moments(mask_pupila) #esta función da números de la forma del snake
@@ -152,14 +148,10 @@ def snakes(roi_rgb):
     return mask_snake, mask_pupila
 
 def watershed_pupila(roi_rgb, mask_pupila):
-    #saco el flash otra vez para no tener problemas
+
     gris = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
-    flash = (gris > 200).astype(np.uint8) * 255
-    flash = cv2.dilate(flash, np.ones((5, 5), np.uint8))
-    gris_sin_flash = cv2.inpaint(gris, flash, 3, cv2.INPAINT_TELEA)
 
-
-    gradiente = sobel(gris_sin_flash.astype(float) / 255.0) #aplico un filtro sobel para calcular gradiente y ver donde están los bordes
+    gradiente = sobel(gris.astype(float) / 255.0) #aplico un filtro sobel para calcular gradiente y ver donde están los bordes
 
     
     radio = np.sqrt((mask_pupila > 0).sum() / np.pi) #se fija el radio de la pupila con la mascara que saque del snake, es la misma
@@ -192,12 +184,13 @@ def watershed_pupila(roi_rgb, mask_pupila):
     return mask_ws
     
     
-
     
 
 def ejecutar_modulo_2(config):
 
     print("   EJECUTANDO MÓDULO 2: SEGMENTACIÓN Y MORFOLOGÍA DE LA PUPILA ")
+    print("--------------------------------------------------------")
+    print("Parte 2.1")
     # Extrae parámetros del diccionario global del main
     video_path = config['video_path']
     roi = config['roi']
@@ -222,4 +215,45 @@ def ejecutar_modulo_2(config):
     mask_ws = watershed_pupila(roi_rgb, mask_pupila)
 
     
-    #Modulo 2.2: Morfologia matematica para limpieza de mascara
+    print("----------------------------------------------------")
+    print("Parte 2.2")
+    j = True
+    while j:
+        print("A continuación, elija la máscara del método que quiera mejorar")
+        print("1. Otsu")
+        print("2. K-means")
+        print("3. Snakes")
+        print("4. Watershed")
+        print("5. Finalizar")
+        
+        try:
+            caso = int(input("Seleccione una opción (1-5):"))
+            if caso == 1:
+                mascara = mascara_otsu
+                j = False
+            elif caso == 2:
+                n = True
+                while n:
+                    try:
+                        subcaso = int(input("Ingrese el valor de 2 a 5 del valor de K: "))
+                    except ValueError:
+                        subcaso = 0
+                    if subcaso in mascaras_kmeans:
+                        n = False
+                    else:
+                        print("Por favor ingrese un número entre 2 y 5")
+                mascara = mascaras_kmeans[subcaso]
+                j = False
+            elif caso == 3:
+                mascara = mask_snake
+                j = False
+            elif caso == 4: 
+                mascara = mask_ws
+                j = False
+            elif caso == 5:
+                return
+            else:
+                print("Por favor, ingrese un número válido")
+        except ValueError:
+            print("Por favor, ingrese un número válido")
+        
