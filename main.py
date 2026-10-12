@@ -166,7 +166,7 @@ def main():
         elif opcion == "3":
             print("[INFO] El Módulo 3 se implementará en la siguiente etapa.")
         elif opcion == "4":
-            print("[INFO] El Módulo 4 se implementará en la siguiente etapa.")
+            Modulo4.ejecutar_modulo_4(config)
         elif opcion == "5":
             print("\nRe-seleccionando Frame y ROI...")
             # Re-selección de frame opcional
