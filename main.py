@@ -4,6 +4,7 @@ import cv2
 import tkinter as tk
 from tkinter import filedialog
 
+
 # Importación de los módulos del proyecto
 from modulos import Modulo1
 from modulos import Modulo2
@@ -15,7 +16,7 @@ from modulos import Modulo4
 # =============================================================================
 
 def seleccionar_video_gui():
-    """Abre una ventana exploradora de archivos para seleccionar el video."""
+    #Abre una ventana exploradora de archivos para seleccionar el video.
     root = tk.Tk()
     root.withdraw()
     root.attributes('-topmost', True)
@@ -32,13 +33,13 @@ def seleccionar_video_gui():
 
 
 def seleccionar_roi_interactivo(video_path, num_frame=0):
-    """
-    Abre una ventana interactiva de OpenCV con el primer frame del video.
-    Permite arrastrar y soltar con el mouse para encuadrar la ROI del ojo.
-    - Presionar ENTER o ESPACIO para confirmar la selección.
-    - Presionar 'c' para cancelar.
-    Devuelve: tupla (ymin, ymax, xmin, xmax)
-    """
+   
+    #Abre una ventana interactiva de OpenCV con el primer frame del video.
+    #Permite arrastrar y soltar con el mouse para encuadrar la ROI del ojo.
+    #- Presionar ENTER o ESPACIO para confirmar la selección.
+    #- Presionar 'c' para cancelar.
+   # Devuelve: tupla (ymin, ymax, xmin, xmax)
+    
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, num_frame)
     ret, frame_bgr = cap.read()
@@ -69,7 +70,7 @@ def seleccionar_roi_interactivo(video_path, num_frame=0):
 
 
 def obtener_info_video(video_path):
-    """Obtiene datos técnicos del archivo de video."""
+    #Obtiene datos técnicos del archivo de video.
     cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -89,15 +90,17 @@ def obtener_info_video(video_path):
 # =============================================================================
 # FLUJO PRINCIPAL Y MENÚ DE NAVEGACIÓN
 # =============================================================================
-
+#Decidimos armar un archivo principal (main) y desarrollar cada parte del trabajo por separado para poder hacer el proyecto de forma modular
+#De esta forma se puede correr cada modulo por separado y es mas facil detectar errores o realizar modificaciones particulares
 def main():
     print("==================================================")
-    print("      PROCESAMIENTO DE IMÁGENES BIOMÉDICAS        ")
-    print("         Análisis del Reflejo Fotomotor           ")
+    print("       PROCESAMIENTO DE IMÁGENES BIOMÉDICAS        ")
+    print("        Análisis del Reflejo Fotomotor           ")
     print("==================================================")
 
-    # 1. Selección del archivo de video mediante explorador gráfico
-    print("\n[1/3] Seleccione el archivo de video en la ventana emergente...")
+    #Selección del archivo de video mediante explorador gráfico
+    #Se guarda toda la informacion seleccionada sobre el video para luego poder aplicarla a los diferentes modulos
+    print("\n Seleccione el archivo de video en la ventana emergente...")
     video_path = seleccionar_video_gui()
     
     if not video_path:
@@ -106,39 +109,58 @@ def main():
 
     print(f"Ruta seleccionada: {video_path}")
 
-    # 2. Lectura de información técnica del video
+    #Lectura de información técnica del video
     info = obtener_info_video(video_path)
     print(f"Propiedades: {info['ancho']}x{info['alto']} px | {info['fps']:.2f} FPS | {info['duracion_sec']:.1f} segundos ({info['total_frames']} frames)")
 
-    # 3. Selección interactiva de la ROI dibujando un recuadro sobre el ojo
-    print("\n[2/3] Dibuje el recuadro alrededor del ojo/pupila y presione ENTER...")
-    roi = seleccionar_roi_interactivo(video_path, num_frame=0)
+    #Selección del Frame de trabajo
+    total_frames = info['total_frames']
+    while True:
+        try:
+            input_frame = input(f"\nIngrese el número de frame a analizar (0 a {total_frames - 1}) [ENTER para 0]: ").strip()
+            if not input_frame:
+                frame_idx = 0
+                break
+            frame_idx = int(input_frame)
+            if 0 <= frame_idx < total_frames:
+                break
+            print(f"[ERROR] Debe ingresar un número entre 0 y {total_frames - 1}.")
+        except ValueError:
+            print("[ERROR] Por favor, ingrese un número entero válido.")
+
+    print(f"Frame seleccionado: {frame_idx}")
+
+    #Selección interactiva de la ROI sobre el frame elegido
+    print(f"\n Dibuje el recuadro alrededor del ojo/pupila en el frame {frame_idx} y presione ENTER...")
+    roi = seleccionar_roi_interactivo(video_path, num_frame=frame_idx)
     print(f"Coordenadas ROI (ymin, ymax, xmin, xmax): {roi}")
 
-    # 4. Diccionario de Configuración global para compartir con los módulos
+    #Diccionario de Configuración global para compartir con los módulos, todos utilizan estas claves
     config = {
         'video_path': video_path,
         'roi': roi,             # (ymin, ymax, xmin, xmax)
-        'frame_idx': 0,         # Frame de trabajo inicial
+        'frame_idx': frame_idx, # Frame seleccionado por el usuario
         'info_video': info
     }
 
-    # 5. Menú Interactivo de Ejecución
+    #Menú Interactivo de Ejecución
     while True:
         print("\n--------------------------------------------------")
-        print("                MENÚ DE MÓDULOS                   ")
+        print("                  MENÚ DE MÓDULOS                 ")
+        print("--------------------------------------------------")
+        print(f" Video actual: {info['ancho']}x{info['alto']} px | Frame actual: {config['frame_idx']}")
         print("--------------------------------------------------")
         print("1. Módulo 1: Fundamentos, Espacios de Color y Filtrado")
         print("2. Módulo 2: Segmentación y Morfología (Pupila)")
         print("3. Módulo 3: Caracterización y Curva Temporal")
         print("4. Módulo 4: Compresión de Imagen")
-        print("5. Cambiar ROI o Video de trabajo")
+        print("5. Cambiar Frame / ROI de trabajo")
         print("0. Salir")
         
         opcion = input("\nIngrese una opción (0-5): ").strip()
 
         if opcion == "1":
-            Modulo1.ejecutar_modulo_1(config)
+            Modulo1.ejecutar_modulo_1(config)  # Llama a la función 'ejecutar' del Módulo 1 y asi sucesivamente para cada modulo
         elif opcion == "2":
             print("[INFO] El Módulo 2 se implementará en la siguiente etapa.")
         elif opcion == "3":
@@ -146,9 +168,19 @@ def main():
         elif opcion == "4":
             print("[INFO] El Módulo 4 se implementará en la siguiente etapa.")
         elif opcion == "5":
-            print("\nRe-seleccionando ROI...")
-            config['roi'] = seleccionar_roi_interactivo(config['video_path'], num_frame=0)
-            print(f"Nueva ROI registrada: {config['roi']}")
+            print("\nRe-seleccionando Frame y ROI...")
+            # Re-selección de frame opcional
+            try:
+                f_inp = input(f"Nuevo frame (0 a {total_frames - 1}) [ENTER para mantener {config['frame_idx']}]: ").strip()
+                if f_inp:
+                    f_val = int(f_inp)
+                    if 0 <= f_val < total_frames:
+                        config['frame_idx'] = f_val
+            except ValueError:
+                print("Opción inválida, se mantendrá el frame anterior.")
+
+            config['roi'] = seleccionar_roi_interactivo(config['video_path'], num_frame=config['frame_idx'])
+            print(f"Configuración actualizada: Frame {config['frame_idx']} | ROI: {config['roi']}")
         elif opcion == "0":
             print("Saliendo del programa...")
             break
