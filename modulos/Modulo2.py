@@ -183,6 +183,32 @@ def watershed_pupila(roi_rgb, mask_pupila):
     
     return mask_ws
     
+def edac(mascara):
+    #Erosionar
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) #defino el Kernel de 5x5 
+    erosion = cv2.erode(mascara, kernel) #le aplico el kernel a la máscara para erosionarlo
+    
+    #Dilatación
+    dilatacion = cv2.dilate(mascara, kernel) #le aplico el kernel a la máscara 
+    
+    #apertura
+    apertura = cv2.dilate(erosion, kernel) #podría hacerse con función nativa pero ya que armé lo otro, lo uso
+    
+    #cierre
+    cierre = cv2.erode(dilatacion, kernel) #idem anterior
+    
+    fig, ax = plt.subplots(1, 5, figsize=(18, 4))
+    ax[0].imshow(mascara, cmap="gray");    ax[0].set_title("Original")
+    ax[1].imshow(erosion, cmap="gray");    ax[1].set_title("Erosión")
+    ax[2].imshow(dilatacion, cmap="gray"); ax[2].set_title("Dilatación")
+    ax[3].imshow(apertura, cmap="gray");   ax[3].set_title("Apertura")
+    ax[4].imshow(cierre, cmap="gray");     ax[4].set_title("Cierre")
+    for a in ax:
+        a.axis("off")
+    plt.show()
+    
+    return erosion, dilatacion, apertura, cierre
+
     
     
 
@@ -257,3 +283,8 @@ def ejecutar_modulo_2(config):
         except ValueError:
             print("Por favor, ingrese un número válido")
         
+    print("Ejecutando la erosión, dilatación, apertura y cierre de la máscara")
+    
+    mascara_erosionada, mascara_dilatada, mascara_apertura, mascara_cierre = edac(mascara=mascara)
+    
+    
