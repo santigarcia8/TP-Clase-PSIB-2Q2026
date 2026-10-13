@@ -1,226 +1,217 @@
 #Modulo 3: Extraccion de caracteristicas, analisis de textura y dinamica temporal
 #Modulo 3.1: Descriptores morfometricos y de textura en el frame segmentado
-#Modulo 3.2: Procesameinto en video y curva temporal fisiologica
+#Modulo 3.2: Procesamiento en video y curva temporal fisiologica
+import os
+import csv
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import skew
+from scipy.signal import medfilt, savgol_filter
 from skimage.feature import graycomatrix, graycoprops
 
-NIVELES_GRIS = 64 #cantidad de niveles a los que cuantizamos la ROI (la guia pide 32 o 64)
+NIVELES_GRIS = 64                 #niveles a los que se cuantiza la ROI (la guia pide 32 o 64)
+CARPETA_RESULTADOS = "resultados" #carpeta donde se guardan los CSV del modulo
+CANALES = ('R', 'G', 'B')
+COLORES = {'R': 'tab:red', 'G': 'tab:green', 'B': 'tab:blue'}
 
 
 # =============================================================================
-# FUNCIONES AUXILIARES: LECTURA DEL FRAME Y CUANTIZACION DE LA ROI
+# FUNCIONES AUXILIARES
 # =============================================================================
 
 def cargar_frame_y_roi(video_path, num_frame=0, roi_coords=None):
-    cap = cv2.VideoCapture(video_path) #abre el video desde la ruta elegida en el main
+    cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, num_frame) #se para en el frame elegido
     ok, frame_bgr = cap.read()
     cap.release()
     if not ok or frame_bgr is None:
         raise ValueError(f"No se pudo leer el frame {num_frame} del video.")
-
     frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) #OpenCV lee en BGR, lo pasamos a RGB
+    return frame_rgb, recortar(frame_rgb, roi_coords)
 
-    if roi_coords is not None:
-        ymin, ymax, xmin, xmax = roi_coords
-        roi_rgb = frame_rgb[ymin:ymax, xmin:xmax]
-    else:
-        roi_rgb = frame_rgb
-    return frame_rgb, roi_rgb
+
+def recortar(imagen, roi_coords):
+    if roi_coords is None:
+        return imagen
+    ymin, ymax, xmin, xmax = roi_coords
+    return imagen[ymin:ymax, xmin:xmax]
 
 
 def cuantizar(imagen, niveles=NIVELES_GRIS):
-    #Pasa una imagen de 8 bits (256 niveles, 0-255) a 'niveles' niveles de gris (0 a niveles-1)
+    #Pasa una imagen de 8 bits (0-255) a 'niveles' niveles de gris (0 a niveles-1)
     return (imagen.astype(np.uint16) * niveles // 256).astype(np.uint8)
+
+
+def circulo(forma, centro, radio):
+    #Mascara (0/255) de un circulo lleno
+    m = np.zeros(forma, np.uint8)
+    cv2.circle(m, (int(centro[0]), int(centro[1])), int(radio), 255, -1)
+    return m
+
+
+def rellenar(forma, contorno):
+    #Mascara (0/255) con el interior de un contorno
+    m = np.zeros(forma, np.uint8)
+    cv2.drawContours(m, [contorno], -1, 255, thickness=cv2.FILLED)
+    return m
 
 
 # =============================================================================
 # PARTE 3.1 - PASO PREVIO: SEGMENTACION DE LA PUPILA
 # =============================================================================
 #La consigna pide trabajar "a partir de la ROI segmentada". Como el Modulo 2 grafica cada metodo y no devuelve
-#la mascara, armamos aca una version sin graficos que tambien vamos a reutilizar en la parte 3.2 (todos los frames).
+#la mascara, armamos una version sin graficos que tambien se reutiliza en la parte 3.2 (todos los frames).
 #Idea: la pupila es la region MAS OSCURA, REDONDA, con MUCHO CONTRASTE contra el iris y con un BORDE NITIDO.
 #Las pestañas y las sombras de la piel tambien son oscuras, pero son finas, alargadas o tocan el borde de la ROI.
 
 def puntuar_mancha(contorno, gris, gradiente):
-    #Le da un puntaje a una mancha oscura segun cuanto se parece a una pupila. Devuelve None si se descarta
+    #Puntaje de una mancha oscura segun cuanto se parece a una pupila (None si se descarta)
     h, w = gris.shape
     area = cv2.contourArea(contorno)
     if area < 0.0005 * h * w or area > 0.25 * h * w: #muy chica (ruido) o muy grande (sombra, ceja)
         return None
+    env = cv2.convexHull(contorno)
+    area_env = cv2.contourArea(env)
+    circularidad = 4 * np.pi * area_env / cv2.arcLength(env, True) ** 2 #1 = circulo
+    solidez = area / area_env                                         #las pestañas tienen huecos
+    (x, y), r = cv2.minEnclosingCircle(env)
+    llenado = area_env / (np.pi * r ** 2)                             #lo alargado llena poco su circulo
 
-    envolvente = cv2.convexHull(contorno)
-    area_env = cv2.contourArea(envolvente)
-    circularidad = 4 * np.pi * area_env / cv2.arcLength(envolvente, True) ** 2  #1 = circulo
-    solidez = area / area_env                              #que tan "maciza" es (las pestañas tienen huecos)
-    (x, y), r = cv2.minEnclosingCircle(envolvente)
-    llenado = area_env / (np.pi * r ** 2)                  #que tanto llena su circulo envolvente (lo alargado llena poco)
-
-    adentro = np.zeros((h, w), np.uint8)
-    cv2.drawContours(adentro, [envolvente], -1, 255, thickness=cv2.FILLED)
-    anillo = np.zeros((h, w), np.uint8)
-    cv2.circle(anillo, (int(x), int(y)), int(1.8 * r), 255, -1)
+    adentro = rellenar((h, w), env)
+    anillo = circulo((h, w), (x, y), 1.8 * r)
     anillo[adentro > 0] = 0
     if not anillo.any():
         return None
     contraste = max(gris[anillo > 0].mean() - gris[adentro > 0].mean(), 0) #brillo alrededor - brillo adentro
-
     borde = cv2.findContours(adentro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0][0][:, 0, :]
-    nitidez = gradiente[borde[:, 1], borde[:, 0]].mean() #gradiente medio sobre el borde: maximo en el borde real de la pupila
+    nitidez = gradiente[borde[:, 1], borde[:, 0]].mean() #gradiente medio sobre el borde
 
-    bx, by, bw, bh = cv2.boundingRect(envolvente)
-    toca_borde = bx <= 1 or by <= 1 or bx + bw >= w - 1 or by + bh >= h - 1 #sombras y pestañas suelen tocar el borde
-
-    puntaje = circularidad ** 2 * llenado ** 2 * solidez * contraste * nitidez
-    if toca_borde:
-        puntaje *= 0.3
-    return {'puntaje': puntaje, 'envolvente': envolvente, 'centro': (float(x), float(y)), 'area': area_env}
+    bx, by, bw, bh = cv2.boundingRect(env)
+    toca_borde = bx <= 1 or by <= 1 or bx + bw >= w - 1 or by + bh >= h - 1
+    puntaje = circularidad ** 2 * llenado ** 2 * solidez * contraste * nitidez * (0.3 if toca_borde else 1)
+    return {'puntaje': puntaje, 'envolvente': env, 'centro': (float(x), float(y)), 'area': area_env}
 
 
 def elegir_pupila(candidatas, tolerancia=0.6):
-    #Elige la mancha de mayor puntaje. Pero los distintos umbrales generan manchas "anidadas" (una adentro de otra)
-    #con puntajes parecidos, y las mas grandes se meten en el anillo oscuro del iris. Entonces, entre las anidadas
-    #con puntaje parecido al mejor (>= 60%), nos quedamos con la MAS CHICA, que es la que sigue el borde negro real.
-    #Esto ademas evita que en el video la medicion salte de una mancha a otra entre frames
+    #Elige la mancha de mayor puntaje. Los distintos umbrales generan manchas "anidadas" con puntajes parecidos y las
+    #mas grandes se meten en el anillo oscuro del iris: entre las anidadas con puntaje >= 60% del mejor, nos quedamos
+    #con la MAS CHICA, que sigue el borde negro real (y evita que la medicion salte entre frames)
     if not candidatas:
         return None
     mejor = max(candidatas, key=lambda c: c['puntaje'])
-    anidadas = [c for c in candidatas
-                if c['puntaje'] >= tolerancia * mejor['puntaje']
+    anidadas = [c for c in candidatas if c['puntaje'] >= tolerancia * mejor['puntaje']
                 and 0.4 * mejor['area'] <= c['area'] <= mejor['area']
                 and cv2.pointPolygonTest(mejor['envolvente'], c['centro'], False) >= 0]
     return min(anidadas, key=lambda c: c['area'])
 
 
 def segmentar_pupila(roi_rgb):
-    #Devuelve la mascara de la pupila (0/255) y su contorno. Si no la encuentra devuelve (mascara vacia, None)
+    #Devuelve la mascara de la pupila (0/255) y su contorno, o (mascara vacia, None) si no la encuentra
     gris = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
-    suave = cv2.medianBlur(gris, 5) #la mediana saca ruido impulsivo sin borronear el borde de la pupila
+    suave = cv2.medianBlur(gris, 5) #la mediana saca ruido impulsivo sin borronear el borde
     h, w = gris.shape
     gradiente = np.hypot(cv2.Sobel(suave, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(suave, cv2.CV_32F, 0, 1, ksize=3))
-
-    k = max(3, int(min(h, w) / 80)) #el tamaño del kernel depende del tamaño de la ROI
-    k = k if k % 2 == 1 else k + 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    k = max(3, int(min(h, w) / 80)) #kernel proporcional al tamaño de la ROI (impar)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k + (k % 2 == 0),) * 2)
 
     def candidatas_de(binaria):
-        binaria = cv2.morphologyEx(binaria, cv2.MORPH_OPEN, kernel)   #apertura: borra pestañas finas y puntitos
-        binaria = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, kernel)  #cierre: tapa huecos chicos (reflejos)
-        contornos, _ = cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        puntuadas = [puntuar_mancha(c, suave, gradiente) for c in contornos]
+        binaria = cv2.morphologyEx(binaria, cv2.MORPH_OPEN, kernel)  #apertura: borra pestañas finas y puntitos
+        binaria = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, kernel) #cierre: tapa huecos chicos (reflejos)
+        puntuadas = [puntuar_mancha(c, suave, gradiente)
+                     for c in cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]]
         return [p for p in puntuadas if p is not None]
 
-    #Paso 1: umbralizacion multinivel. No sabemos de antemano que tan oscura ni que tan grande es la pupila,
-    #asi que probamos varios umbrales (el 1%, 2%, ..., 25% de pixeles mas oscuros) y juntamos todas las manchas
+    #Paso 1: umbralizacion multinivel (1%, 2%, ..., 25% de pixeles mas oscuros) y eleccion de la mejor mancha
     candidatas = []
     for porcentaje in [1, 2, 3, 5, 8, 12, 16, 20, 25]:
-        umbral = np.percentile(suave, porcentaje)
-        candidatas += candidatas_de((suave <= umbral).astype(np.uint8) * 255)
+        candidatas += candidatas_de((suave <= np.percentile(suave, porcentaje)).astype(np.uint8) * 255)
     elegida = elegir_pupila(candidatas)
     if elegida is None:
         return np.zeros((h, w), np.uint8), None
 
-    #Paso 2: si el iris es oscuro y se ve entero, la mancha elegida puede ser iris + pupila.
-    #Aplicamos Otsu SOLO adentro de esa mancha y bajamos un nivel si adentro hay una mancha mas oscura y redonda.
-    #No bajamos si las dos clases tienen brillos parecidos (es solo textura) o si lo oscuro es casi toda
-    #la mancha (eso pasa cuando lo unico que se separa es un reflejo)
+    #Paso 2: si el iris es oscuro, la mancha elegida puede ser iris + pupila. Aplicamos Otsu SOLO adentro de ella
+    #y bajamos un nivel si hay una mancha mas oscura y redonda. No bajamos si las clases tienen brillos parecidos
+    #(es solo textura) o si lo oscuro es casi toda la mancha (lo unico que se separa es un reflejo)
     for _ in range(3):
-        region = np.zeros((h, w), np.uint8)
-        cv2.drawContours(region, [elegida['envolvente']], -1, 255, thickness=cv2.FILLED)
+        region = rellenar((h, w), elegida['envolvente'])
         adentro = suave[region > 0]
         u2, _ = cv2.threshold(adentro.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         oscuros, claros = adentro[adentro <= u2], adentro[adentro > u2]
-        if oscuros.size == 0 or claros.size == 0:
-            break
-        if claros.mean() - oscuros.mean() < 20 or oscuros.size / adentro.size > 0.85:
+        if oscuros.size == 0 or claros.size == 0 or claros.mean() - oscuros.mean() < 20 or oscuros.size / adentro.size > 0.85:
             break
         sub = elegir_pupila(candidatas_de(((suave <= u2) & (region > 0)).astype(np.uint8) * 255))
-        if sub is None:
-            break
-        circ_sub = 4 * np.pi * sub['area'] / cv2.arcLength(sub['envolvente'], True) ** 2
-        if circ_sub < 0.6 or sub['area'] < 0.5 * oscuros.size:
+        if sub is None or 4 * np.pi * sub['area'] / cv2.arcLength(sub['envolvente'], True) ** 2 < 0.6 or sub['area'] < 0.5 * oscuros.size:
             break
         elegida = sub
 
-    #Paso 3: la mascara final es la envolvente convexa de la mancha elegida. Como la pupila es convexa,
-    #asi se rellenan los "mordiscos" que dejan los reflejos sobre el borde y los reflejos que quedan adentro
-    mascara = np.zeros((h, w), np.uint8)
-    cv2.drawContours(mascara, [elegida['envolvente']], -1, 255, thickness=cv2.FILLED)
-    return mascara, elegida['envolvente']
+    #Paso 3: mascara = envolvente convexa (la pupila es convexa: se rellenan los "mordiscos" de los reflejos)
+    return rellenar((h, w), elegida['envolvente']), elegida['envolvente']
+
+
+def preparar_frame(config):
+    #Segmenta el frame de trabajo una sola vez y lo reutiliza en las 3 consignas de la 3.1
+    #(se vuelve a calcular si en el main se cambia el frame o la ROI)
+    clave = (config['video_path'], config.get('frame_idx', 0), tuple(config['roi']) if config['roi'] else None)
+    if config.get('frame_m3', {}).get('clave') != clave:
+        _, roi_rgb = cargar_frame_y_roi(config['video_path'], config.get('frame_idx', 0), config['roi'])
+        mascara, contorno = segmentar_pupila(roi_rgb)
+        config['frame_m3'] = {'clave': clave, 'roi_rgb': roi_rgb, 'roi_gris': cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY),
+                              'mascara': mascara, 'contorno': contorno}
+    f = config['frame_m3']
+    if f['contorno'] is None:
+        print("[ERROR] No se encontró la pupila en este frame. Probá con otro frame o con otra ROI (opción 5 del menú).")
+        return None
+    return f
 
 
 # =============================================================================
 # PARTE 3.1 - CONSIGNA 1: DESCRIPTORES MORFOMETRICOS (FORMA)
 # =============================================================================
 
-# ---- Consigna 1.a: Area (A) en pixeles y Perimetro (P) ----------------------
-def calcular_area_perimetro(mascara, contorno):
-    area = float(np.count_nonzero(mascara)) #area = cantidad de pixeles blancos de la mascara
-    perimetro = cv2.arcLength(contorno, True) #largo del contorno cerrado de la pupila
-    return area, perimetro
-
-
-# ---- Consigna 1.b: Coordenadas del Centroide (Xc, Yc) -----------------------
-def calcular_centroide(mascara):
+def descriptores_morfometricos(mascara, contorno):
     M = cv2.moments(mascara, binaryImage=True)
-    xc = M["m10"] / M["m00"] #centroide = momento de orden 1 / momento de orden 0 (que es el area)
-    yc = M["m01"] / M["m00"]
-    return xc, yc
-
-
-# ---- Consigna 1.c: Circularidad y Excentricidad -----------------------------
-def calcular_circularidad_excentricidad(mascara, contorno):
-    #Circularidad = 4*pi*A/P^2: vale 1 para un circulo perfecto y baja cuanto mas deformada esta la pupila.
-    #Usamos el area del poligono del contorno (no la cuenta de pixeles) para que area y perimetro se midan
-    #sobre la misma curva; si no, por la discretizacion en pixeles puede dar apenas mayor a 1
+    #1.a) Area = cantidad de pixeles de la mascara | Perimetro = largo del contorno cerrado
+    area = float(np.count_nonzero(mascara))
     perimetro = cv2.arcLength(contorno, True)
+    #1.b) Centroide = momentos de orden 1 / momento de orden 0 (area)
+    xc, yc = M["m10"] / M["m00"], M["m01"] / M["m00"]
+    #1.c) Circularidad = 4*pi*A/P^2 (1 = circulo). Usamos el area del poligono del contorno para que area y perimetro
+    #     se midan sobre la misma curva (con la cuenta de pixeles puede dar apenas > 1 por la discretizacion)
     circularidad = 4 * np.pi * cv2.contourArea(contorno) / perimetro ** 2
-
-    #Excentricidad a partir de los momentos centrales de orden 2 (es la matriz de covarianza de la mancha).
-    #Sus autovalores son proporcionales al cuadrado de los semiejes de la elipse equivalente
-    M = cv2.moments(mascara, binaryImage=True)
+    #     Excentricidad: autovalores de la matriz de covarianza (momentos centrales de orden 2), proporcionales al
+    #     cuadrado de los semiejes de la elipse equivalente. 0 = circulo, cerca de 1 = elipse muy aplastada
     cov = np.array([[M["mu20"], M["mu11"]], [M["mu11"], M["mu02"]]]) / M["m00"]
     l_menor, l_mayor = np.sort(np.linalg.eigvalsh(cov))
-    excentricidad = np.sqrt(1 - l_menor / l_mayor) if l_mayor > 0 else 0.0 #0 = circulo, cerca de 1 = elipse muy aplastada
-    return circularidad, excentricidad
+    excentricidad = np.sqrt(1 - l_menor / l_mayor) if l_mayor > 0 else 0.0
+    return {'area_px': area, 'perimetro_px': perimetro, 'centroide_x': xc, 'centroide_y': yc,
+            'circularidad': circularidad, 'excentricidad': excentricidad,
+            'diametro_equivalente_px': 2 * np.sqrt(area / np.pi)} #diametro de un circulo de igual area (para D(t))
 
 
-def descriptores_morfometricos(mascara, contorno):
-    #Junta los tres items de la Consigna 1 en un solo diccionario
-    area, perimetro = calcular_area_perimetro(mascara, contorno)
-    xc, yc = calcular_centroide(mascara)
-    circularidad, excentricidad = calcular_circularidad_excentricidad(mascara, contorno)
-    return {
-        'area_px': area,
-        'perimetro_px': perimetro,
-        'centroide_x': xc,
-        'centroide_y': yc,
-        'circularidad': circularidad,
-        'excentricidad': excentricidad,
-        'diametro_equivalente_px': 2 * np.sqrt(area / np.pi), #diametro de un circulo con la misma area (para la curva D(t) de 3.2)
-    }
+def consigna_1_morfometria(config):
+    f = preparar_frame(config)
+    if f is None:
+        return
+    m = descriptores_morfometricos(f['mascara'], f['contorno'])
+    print("\n PARTE 3.1 - Consigna 1: Descriptores morfométricos (forma)")
+    print(f"1.a) Área (A) = {m['area_px']:.0f} px | Perímetro (P) = {m['perimetro_px']:.1f} px")
+    print(f"1.b) Centroide (Xc, Yc) = ({m['centroide_x']:.1f}, {m['centroide_y']:.1f}) px")
+    print(f"1.c) Circularidad (4πA/P²) = {m['circularidad']:.3f} | Excentricidad = {m['excentricidad']:.3f}")
+    print(f"     Diámetro equivalente = {m['diametro_equivalente_px']:.1f} px")
 
-
-def graficar_morfometria(roi_rgb, roi_cuant, mascara, contorno, morfo):
     fig, ax = plt.subplots(1, 3, figsize=(15, 5))
     fig.canvas.manager.set_window_title("Parte 3.1 - Consigna 1: Descriptores morfométricos")
-
-    ax[0].imshow(roi_cuant, cmap='gray', vmin=0, vmax=NIVELES_GRIS - 1)
+    ax[0].imshow(cuantizar(f['roi_gris']), cmap='gray', vmin=0, vmax=NIVELES_GRIS - 1)
     ax[0].set_title(f"ROI cuantizada a {NIVELES_GRIS} niveles")
-
-    ax[1].imshow(mascara, cmap='gray')
-    ax[1].set_title(f"1.a) Máscara de la pupila\nA = {morfo['area_px']:.0f} px   P = {morfo['perimetro_px']:.1f} px")
-
-    ax[2].imshow(roi_rgb)
-    ax[2].plot(contorno[:, 0, 0], contorno[:, 0, 1], '-', color='lime', lw=1.5, label='Contorno')
-    ax[2].plot(morfo['centroide_x'], morfo['centroide_y'], '+r', ms=14, mew=2,
-               label=f"1.b) Centroide ({morfo['centroide_x']:.1f}, {morfo['centroide_y']:.1f})")
-    ax[2].set_title(f"1.c) Circularidad = {morfo['circularidad']:.3f}\nExcentricidad = {morfo['excentricidad']:.3f}")
+    ax[1].imshow(f['mascara'], cmap='gray')
+    ax[1].set_title(f"1.a) Máscara de la pupila\nA = {m['area_px']:.0f} px   P = {m['perimetro_px']:.1f} px")
+    ax[2].imshow(f['roi_rgb'])
+    ax[2].plot(f['contorno'][:, 0, 0], f['contorno'][:, 0, 1], '-', color='lime', lw=1.5, label='Contorno')
+    ax[2].plot(m['centroide_x'], m['centroide_y'], '+r', ms=14, mew=2,
+               label=f"1.b) Centroide ({m['centroide_x']:.1f}, {m['centroide_y']:.1f})")
+    ax[2].set_title(f"1.c) Circularidad = {m['circularidad']:.3f}\nExcentricidad = {m['excentricidad']:.3f}")
     ax[2].legend(loc='lower right', fontsize=8)
-
     for a in ax:
         a.axis('off')
     plt.tight_layout()
@@ -230,139 +221,99 @@ def graficar_morfometria(roi_rgb, roi_cuant, mascara, contorno, morfo):
 # =============================================================================
 # PARTE 3.1 - CONSIGNA 2: TEXTURA DE PRIMER ORDEN (ESTADISTICA GLOBAL)
 # =============================================================================
-#La consigna pide calcular Media, Desvio Estandar, Entropia y Asimetria (Skewness) sobre la ROI de la
-#pupila/iris en los tres canales de color (R, G, B) por separado, usando la ROI cuantizada (64 niveles).
-#Calculamos los estadisticos en dos regiones: la PUPILA (mascara de la segmentacion) y el IRIS (anillo alrededor).
-
-# ---- Consigna 2.a: Region del iris -------------------------------------------
-def estimar_radio_iris(roi_gris, morfo, factor_max=6.0):
-    #Busca el borde iris-esclerotica con un perfil radial: promediamos el brillo sobre circulos de radio creciente
-    #alrededor del centroide de la pupila y buscamos donde mas sube (el iris es mas oscuro que la esclerotica).
-    #Usamos solo los sectores izquierdo y derecho (±45° de la horizontal) porque arriba y abajo lo tapan los parpados.
-    #Empezamos a buscar en 1.6 veces el radio de la pupila: el iris siempre es al menos ~1.5 veces mas grande que la
-    #pupila (pupila de 2 a 8 mm, iris de ~12 mm) y asi no confundimos el borde borroso de la pupila con el del iris
-    h, w = roi_gris.shape
-    xc, yc = morfo['centroide_x'], morfo['centroide_y']
-    r_pupila = morfo['diametro_equivalente_px'] / 2
-    r_max = min(factor_max * r_pupila, max(xc, w - 1 - xc)) #no buscar mas lejos que el borde de la ROI
-    radios = np.arange(int(1.6 * r_pupila), int(r_max))
-    if radios.size < 5:
-        return None
-
-    angulos = np.concatenate([np.linspace(-np.pi / 4, np.pi / 4, 30),
-                              np.linspace(3 * np.pi / 4, 5 * np.pi / 4, 30)])
-    suave = cv2.GaussianBlur(roi_gris, (5, 5), 0).astype(float)
-    perfil = []
-    for r in radios:
-        xs = np.clip(np.round(xc + r * np.cos(angulos)).astype(int), 0, w - 1)
-        ys = np.clip(np.round(yc + r * np.sin(angulos)).astype(int), 0, h - 1)
-        perfil.append(suave[ys, xs].mean()) #brillo medio sobre el circulo de radio r
-    derivada = np.gradient(np.array(perfil))
-    i = int(np.argmax(derivada))
-    if derivada[i] < 2: #no hay un salto claro de brillo: no encontramos el borde del iris
-        return None
-    return float(radios[i])
-
+#Media, Desvio, Entropia y Skewness sobre la ROI cuantizada (64 niveles), en R, G y B por separado,
+#en dos regiones: la PUPILA (mascara de la segmentacion) y el IRIS (anillo alrededor de la pupila).
 
 def mascara_del_iris(roi_gris, mascara_pupila, morfo, factor_iris=2.5):
-    #El iris lo aproximamos como un anillo: desde 1.15 veces el radio de la pupila (para no tomar el borde de la pupila)
-    #hasta un poco antes del borde del iris (85% del radio, el borde esta algo borroso). Si no se encuentra el borde
-    #del iris, usamos 'factor_iris' veces el radio de la pupila
+    #2.a) El iris se aproxima como un anillo desde 1.15 veces el radio de la pupila hasta el 85% del radio del iris.
+    #El borde iris-esclerotica se busca con un perfil radial: brillo medio sobre circulos de radio creciente
+    #(solo sectores izquierdo y derecho, ±45°, porque arriba y abajo tapan los parpados) y nos quedamos con el
+    #radio donde mas sube el brillo. Se busca desde 1.6 veces el radio de la pupila (el iris siempre es al menos
+    #~1.5 veces mas grande) para no confundirlo con el borde borroso de la pupila.
     h, w = roi_gris.shape
-    r_pupila = morfo['diametro_equivalente_px'] / 2
-    r_iris = estimar_radio_iris(roi_gris, morfo)
-    r_externo = 0.85 * r_iris if r_iris is not None else factor_iris * r_pupila
-    centro = (int(round(morfo['centroide_x'])), int(round(morfo['centroide_y'])))
+    xc, yc, rp = morfo['centroide_x'], morfo['centroide_y'], morfo['diametro_equivalente_px'] / 2
+    radios = np.arange(int(1.6 * rp), int(min(6 * rp, max(xc, w - 1 - xc))))
+    r_iris = None
+    if radios.size >= 5:
+        ang = np.r_[np.linspace(-np.pi / 4, np.pi / 4, 30), np.linspace(3 * np.pi / 4, 5 * np.pi / 4, 30)]
+        suave = cv2.GaussianBlur(roi_gris, (5, 5), 0).astype(float)
+        perfil = [suave[np.clip(np.round(yc + r * np.sin(ang)).astype(int), 0, h - 1),
+                        np.clip(np.round(xc + r * np.cos(ang)).astype(int), 0, w - 1)].mean() for r in radios]
+        derivada = np.gradient(np.array(perfil))
+        if derivada.max() >= 2: #hay un salto claro de brillo
+            r_iris = float(radios[np.argmax(derivada)])
 
-    anillo = np.zeros((h, w), np.uint8)
-    cv2.circle(anillo, centro, int(r_externo), 255, -1)
-    cv2.circle(anillo, centro, int(1.15 * r_pupila), 0, -1)
-    anillo[mascara_pupila > 0] = 0
+    centro = (round(xc), round(yc))
+    def anillo_hasta(r_ext):
+        a = circulo((h, w), centro, r_ext)
+        a[circulo((h, w), centro, 1.15 * rp) > 0] = 0
+        a[mascara_pupila > 0] = 0
+        return a
 
-    #Arriba y abajo el anillo puede tocar los parpados, y a los costados la esclerotica. Ambos son bastante mas
-    #claros que el iris, asi que sacamos los pixeles "atipicamente claros" del anillo (criterio robusto con la
-    #mediana y el MAD, que no se dejan influir por esos mismos pixeles)
+    anillo = anillo_hasta(0.85 * r_iris if r_iris else factor_iris * rp)
+    #Sacamos del anillo los pixeles atipicamente claros (parpados, esclerotica) con un criterio robusto (mediana + MAD)
     valores = roi_gris[anillo > 0].astype(float)
-    if valores.size > 0:
+    if valores.size:
         mediana = np.median(valores)
-        mad = 1.4826 * np.median(np.abs(valores - mediana))
-        anillo[(roi_gris > mediana + 3 * mad) & (anillo > 0)] = 0
-
-    #Respaldo: si por algun motivo el anillo quedo vacio o casi vacio, usamos el anillo fijo de 'factor_iris'
-    if np.count_nonzero(anillo) < 50:
-        anillo = np.zeros((h, w), np.uint8)
-        cv2.circle(anillo, centro, int(factor_iris * r_pupila), 255, -1)
-        cv2.circle(anillo, centro, int(1.15 * r_pupila), 0, -1)
-        anillo[mascara_pupila > 0] = 0
-        r_iris = None
+        anillo[(roi_gris > mediana + 3 * 1.4826 * np.median(np.abs(valores - mediana))) & (anillo > 0)] = 0
+    if np.count_nonzero(anillo) < 50: #respaldo: si quedo casi vacio, anillo fijo de factor_iris veces el radio
+        anillo, r_iris = anillo_hasta(factor_iris * rp), None
     return anillo, r_iris
 
 
-def quitar_reflejos(mascara, roi_gris, umbral=230):
-    #Saca de la region los reflejos del flash/ventana (pixeles casi blancos): no son textura del tejido
-    #y arruinarian la media, el desvio y la asimetria
-    limpia = mascara.copy()
-    limpia[roi_gris > umbral] = 0
-    return limpia
+def regiones_y_canales(f):
+    #Regiones pupila e iris (sin reflejos: pixeles casi blancos que no son tejido) y canales R, G, B cuantizados
+    morfo = descriptores_morfometricos(f['mascara'], f['contorno'])
+    iris, r_iris = mascara_del_iris(f['roi_gris'], f['mascara'], morfo)
+    regiones = {}
+    for nombre, m in (('pupila', f['mascara']), ('iris', iris)):
+        regiones[nombre] = m.copy()
+        regiones[nombre][f['roi_gris'] > 230] = 0
+    canales = {c: cuantizar(f['roi_rgb'][:, :, i]) for i, c in enumerate(CANALES)}
+    return regiones, canales, r_iris
 
 
-# ---- Consigna 2.b: Media, Desvio, Entropia y Skewness por canal --------------
-def textura_primer_orden(canal_cuantizado, mascara, niveles=NIVELES_GRIS):
-    #Estadistica global de los pixeles del canal que caen dentro de la mascara
-    valores = canal_cuantizado[mascara > 0].astype(np.float64)
-    if valores.size == 0:
-        return {'media': np.nan, 'desvio': np.nan, 'entropia': np.nan, 'skewness': np.nan}
-
-    media = valores.mean()
-    desvio = valores.std()
-
-    #Entropia de Shannon: H = -sum(p * log2(p)), con p = histograma normalizado (probabilidad de cada nivel)
-    hist = np.bincount(valores.astype(int), minlength=niveles) / valores.size
-    p = hist[hist > 0]
-    entropia = -np.sum(p * np.log2(p)) #en bits (maximo posible = log2(64) = 6 bits)
-
-    #Asimetria: >0 cola hacia valores claros, <0 cola hacia valores oscuros, 0 = simetrico
-    asimetria = float(skew(valores)) if desvio > 0 else 0.0
-
-    return {'media': media, 'desvio': desvio, 'entropia': entropia, 'skewness': asimetria}
+def textura_primer_orden(canal, mascara, niveles=NIVELES_GRIS):
+    #2.b) Estadistica global de los pixeles del canal dentro de la mascara
+    v = canal[mascara > 0].astype(np.float64)
+    if v.size == 0:
+        return dict.fromkeys(('media', 'desvio', 'entropia', 'skewness'), np.nan)
+    p = np.bincount(v.astype(int), minlength=niveles) / v.size #histograma normalizado = probabilidad de cada nivel
+    p = p[p > 0]
+    return {'media': v.mean(), 'desvio': v.std(),
+            'entropia': -np.sum(p * np.log2(p)),                   #Shannon, en bits (maximo log2(64) = 6)
+            'skewness': float(skew(v)) if v.std() > 0 else 0.0}   #>0 cola hacia claros, <0 hacia oscuros
 
 
-def textura_por_canal_y_region(roi_rgb, regiones):
-    #Cuantiza cada canal (R, G, B) a 64 niveles y calcula los 4 estadisticos en cada region
-    canales = {'R': cuantizar(roi_rgb[:, :, 0]),
-               'G': cuantizar(roi_rgb[:, :, 1]),
-               'B': cuantizar(roi_rgb[:, :, 2])}
-    resultados = {}  #resultados[region][canal] = {media, desvio, entropia, skewness}
-    for nombre_region, mascara in regiones.items():
-        resultados[nombre_region] = {c: textura_primer_orden(img, mascara) for c, img in canales.items()}
-    return resultados, canales
+def consigna_2_primer_orden(config):
+    f = preparar_frame(config)
+    if f is None:
+        return
+    regiones, canales, r_iris = regiones_y_canales(f)
+    res = {reg: {c: textura_primer_orden(canales[c], m) for c in CANALES} for reg, m in regiones.items()}
 
-
-def graficar_textura_primer_orden(roi_rgb, regiones, resultados):
-    estadisticos = [('media', 'Media'), ('desvio', 'Desvío estándar'), ('entropia', 'Entropía [bits]'), ('skewness', 'Skewness')]
-    colores = {'R': 'tab:red', 'G': 'tab:green', 'B': 'tab:blue'}
-    nombres_region = list(regiones.keys())
+    print("\n PARTE 3.1 - Consigna 2: Textura de primer orden (ROI cuantizada a 64 niveles)")
+    if r_iris is None:
+        print("[AVISO] No se encontró el borde del iris; se usa un anillo de 2.5 veces el radio de la pupila.")
+    print(f"{'Región':<7}|{'Canal':^7}|{'Media':>8} |{'Desvío':>8} |{'Entropía':>9} |{'Skewness':>9}")
+    for reg in res:
+        for c in CANALES:
+            d = res[reg][c]
+            print(f"{reg:<7}|{c:^7}|{d['media']:>8.2f} |{d['desvio']:>8.2f} |{d['entropia']:>9.3f} |{d['skewness']:>9.3f}")
 
     fig, ax = plt.subplots(1, 5, figsize=(20, 4.5))
     fig.canvas.manager.set_window_title("Parte 3.1 - Consigna 2: Textura de primer orden")
-
-    #Imagen con las dos regiones pintadas encima para que se vea donde se calculo cada cosa
-    superpuesta = roi_rgb.copy().astype(float)
-    superpuesta[regiones['pupila'] > 0] = 0.5 * superpuesta[regiones['pupila'] > 0] + [127, 0, 0]
-    superpuesta[regiones['iris'] > 0] = 0.6 * superpuesta[regiones['iris'] > 0] + [0, 100, 0]
-    ax[0].imshow(superpuesta.astype(np.uint8))
+    vista = f['roi_rgb'].astype(float)
+    vista[regiones['pupila'] > 0] = 0.5 * vista[regiones['pupila'] > 0] + [127, 0, 0]
+    vista[regiones['iris'] > 0] = 0.6 * vista[regiones['iris'] > 0] + [0, 100, 0]
+    ax[0].imshow(vista.astype(np.uint8)); ax[0].axis('off')
     ax[0].set_title("2.a) Regiones: pupila (rojo) / iris (verde)")
-    ax[0].axis('off')
-
-    x = np.arange(len(nombres_region))
-    for i, (clave, titulo) in enumerate(estadisticos):
-        for j, canal in enumerate(['R', 'G', 'B']):
-            valores = [resultados[reg][canal][clave] for reg in nombres_region]
-            ax[i + 1].bar(x + (j - 1) * 0.25, valores, width=0.25, color=colores[canal], label=canal)
-        ax[i + 1].set_xticks(x)
-        ax[i + 1].set_xticklabels([n.capitalize() for n in nombres_region])
-        ax[i + 1].set_title(f"2.b) {titulo}")
-        ax[i + 1].grid(axis='y', alpha=0.3)
+    for i, (clave, titulo) in enumerate([('media', 'Media'), ('desvio', 'Desvío estándar'),
+                                         ('entropia', 'Entropía [bits]'), ('skewness', 'Skewness')]):
+        for j, c in enumerate(CANALES):
+            ax[i + 1].bar(np.arange(2) + (j - 1) * 0.25, [res[r][c][clave] for r in res], 0.25, color=COLORES[c], label=c)
+        ax[i + 1].set_xticks(range(2)); ax[i + 1].set_xticklabels(['Pupila', 'Iris'])
+        ax[i + 1].set_title(f"2.b) {titulo}"); ax[i + 1].grid(axis='y', alpha=0.3)
     ax[1].legend()
     plt.tight_layout()
     plt.show()
@@ -371,108 +322,459 @@ def graficar_textura_primer_orden(roi_rgb, regiones, resultados):
 # =============================================================================
 # PARTE 3.1 - CONSIGNA 3: TEXTURA DE SEGUNDO ORDEN (GLCM)
 # =============================================================================
+#La GLCM cuenta cuantas veces un pixel de nivel i tiene un vecino de nivel j (distancia 1, en 0°/45°/90°/135°).
+#A diferencia de la textura de primer orden (solo el histograma), tiene en cuenta la DISPOSICION ESPACIAL.
 
-# ---- Consigna 3.a: Construccion de la GLCM dentro de una region --------------
-def calcular_glcm(canal_cuantizado, mascara, niveles=NIVELES_GRIS, distancia=1):
-    #graycomatrix trabaja sobre la imagen rectangular completa, pero nosotros queremos solo los pares de
-    #pixeles que caen ADENTRO de la region (pupila o iris). Sumamos 1 a todos los niveles (quedan de 1 a 64),
-    #ponemos en 0 todo lo que esta afuera de la mascara, calculamos la GLCM con 65 niveles y despues borramos
-    #la fila y la columna 0. Asi se descartan todos los pares en los que algun pixel cae afuera de la region
+def glcm_region(canal, mascara, niveles=NIVELES_GRIS):
+    #3.a) GLCM solo con los pares de pixeles que caen ADENTRO de la region: sumamos 1 a todos los niveles,
+    #ponemos en 0 lo de afuera, calculamos con 65 niveles y borramos la fila y columna 0 (= afuera de la region)
     ys, xs = np.nonzero(mascara)
     if ys.size == 0:
-        return None
-    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1 #recortamos al rectangulo de la region
-    recorte = canal_cuantizado[y0:y1, x0:x1].astype(np.uint8) + 1
-    recorte[mascara[y0:y1, x0:x1] == 0] = 0
-
-    #4 direcciones (0°, 45°, 90°, 135°) para que el resultado no dependa de la orientacion de la textura.
-    #symmetric=True cuenta el par (i,j) y tambien el (j,i)
-    angulos = [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4]
-    glcm = graycomatrix(recorte, distances=[distancia], angles=angulos, levels=niveles + 1, symmetric=True, normed=False)
-    glcm = glcm[1:, 1:, :, :].astype(np.float64) #sacamos el nivel 0 (= afuera de la region)
-    return glcm
-
-
-# ---- Consigna 3.b: Atributos de la GLCM ------------------------------------------
-def atributos_glcm(glcm):
-    #graycoprops normaliza la GLCM (la pasa a probabilidades) y calcula cada atributo por direccion.
-    #Promediamos las 4 direcciones
-    if glcm is None:
-        return {'contraste': np.nan, 'homogeneidad': np.nan, 'energia': np.nan, 'correlacion': np.nan}
-    return {
-        'contraste': graycoprops(glcm, 'contrast').mean(),       #sum p(i,j)*(i-j)^2: variacion local de intensidad (alto = mas textura)
-        'homogeneidad': graycoprops(glcm, 'homogeneity').mean(), #sum p(i,j)/(1+(i-j)^2): que tan concentrada esta en la diagonal (alto = mas liso)
-        'energia': graycoprops(glcm, 'energy').mean(),           #raiz(sum p(i,j)^2): uniformidad (alto = pocos patrones que se repiten = poca textura)
-        'correlacion': graycoprops(glcm, 'correlation').mean(),  #dependencia lineal entre un pixel y su vecino
+        return None, dict.fromkeys(('contraste', 'homogeneidad', 'energia', 'correlacion'), np.nan)
+    sl = (slice(ys.min(), ys.max() + 1), slice(xs.min(), xs.max() + 1)) #recorte al rectangulo de la region
+    recorte = canal[sl].astype(np.uint8) + 1
+    recorte[mascara[sl] == 0] = 0
+    glcm = graycomatrix(recorte, [1], [0, np.pi / 4, np.pi / 2, 3 * np.pi / 4], levels=niveles + 1,
+                        symmetric=True)[1:, 1:].astype(np.float64)
+    #3.b) Atributos (graycoprops normaliza la GLCM; promediamos las 4 direcciones):
+    return glcm, {
+        'contraste': graycoprops(glcm, 'contrast').mean(),       #sum p(i,j)(i-j)^2: variacion local (alto = mas textura)
+        'homogeneidad': graycoprops(glcm, 'homogeneity').mean(), #sum p(i,j)/(1+(i-j)^2): concentracion en la diagonal
+        'energia': graycoprops(glcm, 'energy').mean(),           #raiz(sum p^2): uniformidad (alto = poca textura)
+        'correlacion': graycoprops(glcm, 'correlation').mean(),  #dependencia lineal entre pixel y vecino
     }
 
 
-def glcm_por_canal_y_region(canales, regiones):
-    #Calcula la GLCM y sus atributos para cada canal (R, G, B) en cada region (pupila, iris)
-    resultados = {}  #resultados[region][canal] = {'atributos': {...}, 'glcm': matriz}
-    for nombre_region, mascara in regiones.items():
-        resultados[nombre_region] = {}
-        for canal, imagen in canales.items():
-            glcm = calcular_glcm(imagen, mascara)
-            resultados[nombre_region][canal] = {'atributos': atributos_glcm(glcm), 'glcm': glcm}
-    return resultados
+def consigna_3_glcm(config):
+    f = preparar_frame(config)
+    if f is None:
+        return
+    regiones, canales, _ = regiones_y_canales(f)
+    res = {reg: {c: glcm_region(canales[c], m) for c in CANALES} for reg, m in regiones.items()}
 
+    print("\n PARTE 3.1 - Consigna 3: Textura de segundo orden (GLCM, d=1, promedio de 0°/45°/90°/135°)")
+    print(f"{'Región':<7}|{'Canal':^7}|{'Contraste':>10} |{'Homogen.':>9} |{'Energía':>8} |{'Correlación':>12}")
+    for reg in res:
+        for c in CANALES:
+            a = res[reg][c][1]
+            print(f"{reg:<7}|{c:^7}|{a['contraste']:>10.3f} |{a['homogeneidad']:>9.3f} |{a['energia']:>8.4f} |{a['correlacion']:>12.3f}")
 
-# ---- Consigna 3.c: Que canal aporta mayor riqueza textural del iris ----------
-def canal_mas_rico_en_textura(resultados_glcm, region='iris'):
-    #Riqueza textural = mucho contraste y baja homogeneidad y energia (muchos patrones distintos, poco uniforme).
-    #Para cada atributo vemos que canal "gana" y despues contamos votos
-    canales = list(resultados_glcm[region].keys())
-    attr = {c: resultados_glcm[region][c]['atributos'] for c in canales}
-    ganadores = {
-        'contraste (mayor)': max(canales, key=lambda c: attr[c]['contraste']),
-        'homogeneidad (menor)': min(canales, key=lambda c: attr[c]['homogeneidad']),
-        'energia (menor)': min(canales, key=lambda c: attr[c]['energia']),
-    }
-    votos = {c: list(ganadores.values()).count(c) for c in canales}
-    return max(votos, key=votos.get), ganadores
+    #3.c) Riqueza textural del iris: gana el canal con mayor contraste y menor homogeneidad y energia (por votos)
+    attr = {c: res['iris'][c][1] for c in CANALES}
+    ganadores = {'contraste (mayor)': max(CANALES, key=lambda c: attr[c]['contraste']),
+                 'homogeneidad (menor)': min(CANALES, key=lambda c: attr[c]['homogeneidad']),
+                 'energia (menor)': min(CANALES, key=lambda c: attr[c]['energia'])}
+    canal_rico = max(CANALES, key=list(ganadores.values()).count)
+    contrastes = [attr[c]['contraste'] for c in CANALES]
+    dif_relativa = 100 * (max(contrastes) - min(contrastes)) / max(contrastes)
+    print("\n3.c) Riqueza textural del estroma iridiano: " + " | ".join(f"{k}: {v}" for k, v in ganadores.items()))
+    print(f"     => Canal con mayor riqueza textural: {canal_rico} (diferencia de contraste entre canales: {dif_relativa:.1f} %)")
+    print(f"     Discusión: el canal {canal_rico} muestra la mayor riqueza textural del iris, pero la diferencia entre canales")
+    print(f"     es de solo {dif_relativa:.1f} %, porque el iris es claro y poco saturado y la compresión del video (H.264)")
+    print("     guarda el color a menor resolución que el brillo, así que los tres canales comparten casi la misma textura fina.")
 
-
-def graficar_glcm(resultados_glcm, region='iris'):
-    canales = ['R', 'G', 'B']
-    colores = {'R': 'tab:red', 'G': 'tab:green', 'B': 'tab:blue'}
     fig, ax = plt.subplots(2, 4, figsize=(18, 8.5))
     fig.canvas.manager.set_window_title("Parte 3.1 - Consigna 3: Textura de segundo orden (GLCM)")
-
-    #Fila de arriba: la GLCM del iris de cada canal (promedio de las 4 direcciones, en escala log para que se vea)
-    for j, canal in enumerate(canales):
-        glcm = resultados_glcm[region][canal]['glcm']
-        if glcm is None: #la region quedo vacia: no hay GLCM para mostrar
-            ax[0, j].text(0.5, 0.5, "Sin datos", ha='center', va='center')
-            ax[0, j].axis('off')
+    for j, c in enumerate(CANALES):
+        glcm = res['iris'][c][0]
+        ax[0, j].set_title(f"3.a) GLCM iris - canal {c} (log)")
+        if glcm is None:
+            ax[0, j].text(0.5, 0.5, "Sin datos", ha='center'); ax[0, j].axis('off')
             continue
         matriz = glcm.mean(axis=(2, 3))
-        ocupado = np.nonzero(matriz.sum(axis=0))[0]
-        lim = min(NIVELES_GRIS, ocupado.max() + 5) if ocupado.size else NIVELES_GRIS #mostramos solo los niveles que aparecen
-        ax[0, j].imshow(np.log1p(matriz[:lim, :lim]), cmap='magma', origin='upper')
-        ax[0, j].set_title(f"3.a) GLCM {region} - canal {canal} (log)")
-        ax[0, j].set_xlabel("nivel j (vecino)")
-        ax[0, j].set_ylabel("nivel i (pixel)")
-
-    #Comparacion de los 4 atributos entre pupila e iris para cada canal (texto)
+        lim = min(NIVELES_GRIS, np.nonzero(matriz.sum(axis=0))[0].max() + 5) #solo los niveles que aparecen
+        ax[0, j].imshow(np.log1p(matriz[:lim, :lim]), cmap='magma')
+        ax[0, j].set_xlabel("nivel j (vecino)"); ax[0, j].set_ylabel("nivel i (pixel)")
     ax[0, 3].axis('off')
-    texto = "Atributos promedio (4 direcciones, d=1)\n\n"
-    for reg in resultados_glcm:
-        texto += f"{reg.upper()}\n"
-        for canal in canales:
-            a = resultados_glcm[reg][canal]['atributos']
-            texto += f"  {canal}: C={a['contraste']:.2f}  H={a['homogeneidad']:.2f}  E={a['energia']:.3f}  Corr={a['correlacion']:.2f}\n"
-        texto += "\n"
-    ax[0, 3].text(0, 0.95, texto, va='top', family='monospace', fontsize=9)
+    ax[0, 3].text(0, 0.95, "\n".join(f"{reg.upper()} {c}: C={res[reg][c][1]['contraste']:.2f} H={res[reg][c][1]['homogeneidad']:.2f} "
+                                     f"E={res[reg][c][1]['energia']:.3f} Corr={res[reg][c][1]['correlacion']:.2f}"
+                                     for reg in res for c in CANALES), va='top', family='monospace', fontsize=8)
+    for i, prop in enumerate(['contraste', 'homogeneidad', 'energia', 'correlacion']):
+        ax[1, i].bar(CANALES, [attr[c][prop] for c in CANALES], color=[COLORES[c] for c in CANALES])
+        ax[1, i].set_title(f"3.b) {prop.capitalize()} - iris"); ax[1, i].grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
 
-    #Fila de abajo: cada atributo en el iris, por canal
-    for i, (clave, titulo) in enumerate([('contraste', 'Contraste'), ('homogeneidad', 'Homogeneidad'),
-                                         ('energia', 'Energía'), ('correlacion', 'Correlación')]):
-        valores = [resultados_glcm[region][c]['atributos'][clave] for c in canales]
-        ax[1, i].bar(canales, valores, color=[colores[c] for c in canales])
-        ax[1, i].set_title(f"3.b) {titulo} - {region}")
-        ax[1, i].grid(axis='y', alpha=0.3)
 
+# =============================================================================
+# PARTE 3.2 - CONSIGNA 1: SEGMENTACION AUTOMATICA FRAME A FRAME Y VALIDACION
+# =============================================================================
+
+def medir_video_frame_a_frame(video_path, roi):
+    #1.a) Recorre el video, segmenta la pupila en cada frame (misma funcion que la 3.1) y guarda area, diametro,
+    #circularidad y centroide. Si en un frame no se encuentra la pupila se guarda NaN
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0 #si el video no trae los fps, asumimos 30
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    claves = ('area_px', 'diametro_equivalente_px', 'circularidad', 'centroide_x', 'centroide_y')
+    filas = []
+    while True:
+        ok, frame_bgr = cap.read()
+        if not ok:
+            break
+        mascara, contorno = segmentar_pupila(recortar(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), roi))
+        morfo = descriptores_morfometricos(mascara, contorno) if contorno is not None else {}
+        filas.append([morfo.get(k, np.nan) for k in claves])
+        if len(filas) % 30 == 0:
+            print(f"\r     Procesando frame {len(filas)}/{total}...", end="")
+    cap.release()
+    print(f"\r     Procesados {len(filas)} frames.                 ")
+    datos = np.array(filas, dtype=float)
+    return {'fps': fps, 'frame': np.arange(len(filas)), 'tiempo_s': np.arange(len(filas)) / fps,
+            'area_px': datos[:, 0], 'diametro_px': datos[:, 1], 'circularidad': datos[:, 2],
+            'centroide_x': datos[:, 3], 'centroide_y': datos[:, 4], 'encontrada': ~np.isnan(datos[:, 0])}
+
+
+def obtener_medicion(config):
+    #Mide el video una sola vez y lo reutiliza en las 4 consignas de la 3.2 (se vuelve a medir si cambia la ROI)
+    clave = (config['video_path'], tuple(config['roi']) if config['roi'] else None)
+    if config.get('medicion_m3', {}).get('clave') != clave:
+        print("     Midiendo la pupila en todos los frames del video...")
+        config['medicion_m3'] = medir_video_frame_a_frame(config['video_path'], config['roi'])
+        config['medicion_m3']['clave'] = clave
+    return config['medicion_m3']
+
+
+def guardar_curva_csv(medicion, nombre_video, d_limpia=None, a_limpia=None):
+    #Salida estandarizada: curva frame a frame (cruda y, si ya se calculo, sin artefactos) en un CSV
+    os.makedirs(CARPETA_RESULTADOS, exist_ok=True)
+    ruta = os.path.join(CARPETA_RESULTADOS, f"{nombre_video}_curva_frame_a_frame.csv")
+    ok = frames_confiables(medicion)
+    with open(ruta, 'w', newline='', encoding='utf-8') as f:
+        e = csv.writer(f)
+        e.writerow(['frame', 'tiempo_s', 'area_px', 'diametro_px', 'circularidad', 'frame_confiable']
+                   + (['area_sin_artefactos_px', 'diametro_sin_artefactos_px'] if d_limpia is not None else []))
+        for k in range(len(medicion['frame'])):
+            e.writerow([k, f"{medicion['tiempo_s'][k]:.4f}", f"{medicion['area_px'][k]:.1f}",
+                        f"{medicion['diametro_px'][k]:.3f}", f"{medicion['circularidad'][k]:.4f}", int(ok[k])]
+                       + ([f"{a_limpia[k]:.1f}", f"{d_limpia[k]:.3f}"] if d_limpia is not None else []))
+    return ruta
+
+
+def frames_confiables(medicion, circ_min=0.8, salto_max=0.2, devolver_motivos=False):
+    #Marca que frames tienen una segmentacion confiable. Los que no lo son son ARTEFACTOS y se reemplazan por
+    #interpolacion (consignas 3 y 4). Cada criterio corresponde a una fuente de artefacto:
+    d = np.nan_to_num(medicion['diametro_px'])
+    mediana = np.nanmedian(medicion['diametro_px'])
+    mediana_movil = medfilt(d, int(medicion['fps'] / 2) // 2 * 2 + 1) #mediana de los vecinos (~0.5 s)
+    desplazamiento = np.r_[0, np.hypot(np.diff(medicion['centroide_x']), np.diff(medicion['centroide_y']))]
+    motivos = {
+        #parpadeo / ojo cerrado: no hay pupila, o el parpado la tapa en parte y deja de ser redonda
+        'parpadeo u oclusion': ~medicion['encontrada'] | (np.nan_to_num(medicion['circularidad']) < circ_min),
+        #ojo fuera de cuadro o segmentacion erronea: tamaño muy distinto al habitual del video
+        'tamaño anomalo': (d < 0.5 * mediana) | (d > 2 * mediana),
+        #movimiento ocular brusco: el centro de la pupila salta mas de medio radio entre dos frames
+        'movimiento ocular': np.nan_to_num(desplazamiento, nan=np.inf) > 0.5 * np.maximum(d / 2, 1),
+        #ruido de segmentacion: el diametro salta mas de un 20% respecto de los frames vecinos
+        'salto brusco': np.abs(d - mediana_movil) > salto_max * mediana_movil,
+    }
+    ok = ~np.any(list(motivos.values()), axis=0)
+    #tramos de frames "buenos" de menos de medio segundo en medio de una zona mala tambien se descartan
+    tramo_corto = np.zeros_like(ok)
+    i = 0
+    while i < len(ok):
+        j = i
+        while j < len(ok) and ok[j] == ok[i]:
+            j += 1
+        tramo_corto[i:j] = ok[i] and j - i < max(1, int(medicion['fps'] / 2))
+        i = j
+    motivos['tramo corto entre artefactos'] = tramo_corto
+    ok &= ~tramo_corto
+    return (ok, motivos) if devolver_motivos else ok
+
+
+def anotar_frame_manual(roi_rgb, titulo):
+    #1.b) Se muestra la ROI agrandada (sin el contorno automatico, para no influir) y se hace click en al menos
+    #5 puntos del borde de la pupila. Se ajusta una elipse (cv2.fitEllipse) y se calcula area y diametro equivalente.
+    #Teclas: ENTER = aceptar | r = borrar puntos | s = saltear frame | ESC = terminar
+    h, w = roi_rgb.shape[:2]
+    escala = max(1.0, 800.0 / max(h, w))
+    base = cv2.resize(cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2BGR), (int(w * escala), int(h * escala)), interpolation=cv2.INTER_CUBIC)
+    puntos = []
+    cv2.namedWindow(titulo, cv2.WINDOW_AUTOSIZE)
+    cv2.setMouseCallback(titulo, lambda ev, x, y, *_: puntos.append((x / escala, y / escala)) if ev == cv2.EVENT_LBUTTONDOWN else None)
+    while True:
+        vista = base.copy()
+        for px, py in puntos:
+            cv2.circle(vista, (int(px * escala), int(py * escala)), 3, (0, 255, 0), -1)
+        if len(puntos) >= 5: #con 5 puntos ya se puede ajustar una elipse: la mostramos
+            (cx, cy), (e1, e2), ang = cv2.fitEllipse(np.array(puntos, np.float32))
+            cv2.ellipse(vista, ((cx * escala, cy * escala), (e1 * escala, e2 * escala), ang), (0, 255, 255), 1)
+        cv2.putText(vista, f"Puntos: {len(puntos)} | ENTER aceptar | r borrar | s saltear | ESC terminar",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.imshow(titulo, vista)
+        tecla = cv2.waitKey(20) & 0xFF
+        if tecla in (13, 10) and len(puntos) >= 5:
+            cv2.destroyWindow(titulo)
+            _, (e1, e2), _ = cv2.fitEllipse(np.array(puntos, np.float32))
+            area = np.pi * (e1 / 2) * (e2 / 2)
+            return {'area_px': area, 'diametro_px': 2 * np.sqrt(area / np.pi)} #mismo criterio que el automatico
+        if tecla == ord('r'):
+            puntos.clear()
+        if tecla in (ord('s'), 27):
+            cv2.destroyWindow(titulo)
+            return None if tecla == ord('s') else 'terminar'
+
+
+def anotaciones_manuales(config, medicion, nombre_video):
+    #1.b) Reutiliza las anotaciones guardadas o anota a mano n frames repartidos en el video (solo frames confiables)
+    ruta = os.path.join(CARPETA_RESULTADOS, f"{nombre_video}_anotaciones_manuales.csv")
+    if os.path.exists(ruta) and input("1.b) Hay anotaciones manuales guardadas. ¿Usarlas? (S/n): ").strip().lower() != 'n':
+        with open(ruta, newline='', encoding='utf-8') as f:
+            return {int(r['frame']): {'area_px': float(r['area_px']), 'diametro_px': float(r['diametro_px'])} for r in csv.DictReader(f)}
+    resp = input("1.b) ¿Cuántos frames querés anotar a mano? [ENTER = 10]: ").strip()
+    n = int(resp) if resp.isdigit() and int(resp) >= 2 else 10
+    validos = np.flatnonzero(frames_confiables(medicion))
+    elegidos = validos[np.linspace(0, len(validos) - 1, n).astype(int)]
+    print("     Hacé click en al menos 5 puntos del borde de la pupila y ENTER (r borrar, s saltear, ESC terminar).")
+    anot = {}
+    for k, fr in enumerate(elegidos):
+        r = anotar_frame_manual(cargar_frame_y_roi(config['video_path'], int(fr), config['roi'])[1],
+                                f"Anotacion manual {k + 1}/{len(elegidos)} - frame {fr}")
+        if r == 'terminar':
+            break
+        if r is not None:
+            anot[int(fr)] = r
+    os.makedirs(CARPETA_RESULTADOS, exist_ok=True)
+    with open(ruta, 'w', newline='', encoding='utf-8') as f:
+        e = csv.writer(f)
+        e.writerow(['frame', 'area_px', 'diametro_px'])
+        e.writerows([fr, f"{a['area_px']:.1f}", f"{a['diametro_px']:.3f}"] for fr, a in sorted(anot.items()))
+    print(f"     Anotaciones guardadas en: {ruta}")
+    return anot
+
+
+def consigna_4_validacion(config):
+    print("\n PARTE 3.2 - Consigna 1: Segmentación automática frame a frame y validación")
+    medicion = obtener_medicion(config)
+    nombre_video = os.path.splitext(os.path.basename(config['video_path']))[0]
+    print(f"1.a) Pupila encontrada en {medicion['encontrada'].sum()} de {len(medicion['frame'])} frames | "
+          f"Diámetro: media {np.nanmean(medicion['diametro_px']):.1f} px, mín {np.nanmin(medicion['diametro_px']):.1f}, "
+          f"máx {np.nanmax(medicion['diametro_px']):.1f}")
+    print(f"     Medición guardada en: {guardar_curva_csv(medicion, nombre_video)}")
+
+    anot = anotaciones_manuales(config, medicion, nombre_video)
+    if len(anot) < 2:
+        print("[AVISO] Hacen falta al menos 2 frames anotados para calcular MAE/RMSE.")
+        return
+    #1.c) MAE = promedio de |automatico - manual| ; RMSE = raiz del promedio de (automatico - manual)^2
+    #     (penaliza mas los errores grandes) ; sesgo = promedio de (automatico - manual)
+    frames = np.array(sorted(anot))
+    res = {}
+    for clave in ('diametro_px', 'area_px'):
+        manual = np.array([anot[f][clave] for f in frames])
+        auto = medicion[clave][frames]
+        res[clave] = (manual, auto, np.mean(np.abs(auto - manual)), np.sqrt(np.mean((auto - manual) ** 2)))
+    d_man, d_aut = res['diametro_px'][:2]
+    print(f"1.c) Validación en {len(frames)} frames anotados:")
+    print(f"     Diámetro: MAE = {res['diametro_px'][2]:.2f} px | RMSE = {res['diametro_px'][3]:.2f} px | "
+          f"error relativo = {100 * np.mean(np.abs(d_aut - d_man) / d_man):.1f} % | sesgo = {np.mean(d_aut - d_man):+.2f} px")
+    print(f"     Área:     MAE = {res['area_px'][2]:.0f} px² | RMSE = {res['area_px'][3]:.0f} px²")
+
+    fig, ax = plt.subplots(1, 2, figsize=(13, 5))
+    fig.canvas.manager.set_window_title("Parte 3.2 - Consigna 1: Validación automático vs. manual")
+    for a, (clave, unidad) in zip(ax, [('diametro_px', 'Diámetro [px]'), ('area_px', 'Área [px²]')]):
+        manual, auto, mae, rmse = res[clave]
+        lim = [min(manual.min(), auto.min()) * 0.9, max(manual.max(), auto.max()) * 1.1]
+        a.plot(lim, lim, 'k--', lw=1, label='Automático = manual')
+        a.plot(manual, auto, 'o', ms=7, label='Frames anotados')
+        for fr, x, y in zip(frames, manual, auto):
+            a.annotate(str(fr), (x, y), textcoords='offset points', xytext=(4, 4), fontsize=7)
+        a.set_xlabel(f"{unidad} manual"); a.set_ylabel(f"{unidad} automático")
+        a.set_title(f"1.c) {unidad.split()[0]}: MAE = {mae:.2f} | RMSE = {rmse:.2f}")
+        a.legend(); a.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+# =============================================================================
+# PARTE 3.2 - CONSIGNA 2: CURVA TEMPORAL 1D DEL DIAMETRO D(t) Y DEL AREA A(t)
+# =============================================================================
+
+def ajustar_escala(ax, valores):
+    #Escala del eje Y ajustada a los frames confiables (si no, los artefactos extremos aplastan la curva)
+    lo, hi = np.nanmin(valores), np.nanmax(valores)
+    ax.set_ylim(lo - 0.3 * (hi - lo), hi + 0.3 * (hi - lo))
+
+
+def consigna_5_curva(config):
+    print("\n PARTE 3.2 - Consigna 2: Curva temporal 1D D(t) y A(t)")
+    medicion = obtener_medicion(config)
+    t, ok = medicion['tiempo_s'], frames_confiables(medicion)
+    print(f"     Duración: {t[-1]:.1f} s ({len(ok)} frames a {medicion['fps']:.1f} fps) | "
+          f"frames confiables: {ok.sum()} ({100 * ok.mean():.1f} %)")
+    fig, ax = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    fig.canvas.manager.set_window_title("Parte 3.2 - Consigna 2: Curva temporal")
+    for a, (clave, etiqueta) in zip(ax, [('diametro_px', 'Diámetro D(t) [px]'), ('area_px', 'Área A(t) [px²]')]):
+        a.plot(t[ok], medicion[clave][ok], '.-', ms=3, lw=1, color='tab:blue', label='Frames confiables')
+        a.plot(t[~ok], medicion[clave][~ok], 'x', ms=5, color='tab:red', label='Frames no confiables (artefactos, ver consigna 4)')
+        ajustar_escala(a, medicion[clave][ok])
+        a.set_ylabel(etiqueta); a.grid(alpha=0.3)
+    ax[0].set_title(f"Curva temporal de la pupila - {os.path.basename(config['video_path'])}")
+    ax[0].legend(fontsize=8)
+    ax[1].set_xlabel("Tiempo [s]")
+    plt.tight_layout()
+    plt.show()
+
+
+# =============================================================================
+# PARTE 3.2 - CONSIGNA 3: PARAMETROS FISIOLOGICOS
+# =============================================================================
+
+def limpiar_curva(medicion):
+    #Metodo de correccion de artefactos (ver consigna 4): los frames no confiables se reemplazan por interpolacion
+    #lineal y la curva se suaviza con un filtro Savitzky-Golay (~0.3 s), que saca el ruido de la segmentacion
+    #sin aplanar la contraccion rapida
+    ok = frames_confiables(medicion)
+    t = medicion['tiempo_s']
+    ventana = int(0.3 * medicion['fps']) // 2 * 2 + 1
+    return [savgol_filter(np.interp(t, t[ok], medicion[c][ok]), ventana, 2) for c in ('diametro_px', 'area_px')] + [ok]
+
+
+def detectar_estimulo(video_path, ok, fps):
+    #Si se prende/apaga una luz, el estimulo es el mayor salto de brillo del video.
+    #Si no hay un salto claro (ej: el estimulo es abrir el ojo), se toma el primer frame confiable
+    cap = cv2.VideoCapture(video_path)
+    brillo = []
+    while True:
+        leido, frame = cap.read()
+        if not leido:
+            break
+        brillo.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean())
+    cap.release()
+    saltos = np.abs(np.diff(medfilt(np.array(brillo), 3)))
+    if saltos.max() > 15: #salto claro (en niveles de gris)
+        return (np.argmax(saltos) + 1) / fps, "salto de brillo (luz)"
+    return np.argmax(ok) / fps, "apertura del ojo (primer frame confiable)"
+
+
+def parametros_fisiologicos(t, d, a, t_est):
+    #3.a) Basal: promedio del segundo previo al estimulo (si el ojo estaba cerrado, los primeros 0.2 s despues)
+    basal = (t >= t_est - 1) & (t < t_est)
+    if basal.sum() < 3:
+        basal = (t >= t_est) & (t < t_est + 0.2)
+    d_basal, a_basal = d[basal].mean(), a[basal].mean()
+    #3.b) Amplitud: diferencia entre el basal y el extremo de la respuesta en los 5 s posteriores
+    #     (si la pupila se achica es una contraccion -registro A-, si se agranda una redilatacion -registro B-)
+    post = np.flatnonzero((t >= t_est) & (t <= t_est + 5))
+    i_min, i_max = post[np.argmin(d[post])], post[np.argmax(d[post])]
+    contraccion = (d_basal - d[i_min]) >= (d[i_max] - d_basal)
+    i_ext = i_min if contraccion else i_max
+    amplitud = abs(d[i_ext] - d_basal)
+    #3.c) Latencia: desde el estimulo hasta que el diametro se aparta del basal un 5% de la amplitud
+    i_inicio = post[np.argmax(np.abs(d[post] - d_basal) >= 0.05 * amplitud)]
+    #3.d) Velocidades (derivada del diametro): pico de contraccion antes del minimo y de redilatacion despues
+    v = np.gradient(d, t)
+    return {'tipo': 'A (contraccion)' if contraccion else 'B (redilatacion)',
+            't_estimulo_s': t_est, 'latencia_s': t[i_inicio] - t_est,
+            'diametro_basal_px': d_basal, 'diametro_extremo_px': d[i_ext], 't_extremo_s': t[i_ext],
+            'amplitud_diametro_px': amplitud, 'amplitud_area_px': abs(a[i_ext] - a_basal),
+            'vel_contraccion_px_s': -v[post[0]:i_min + 1].min() if contraccion else np.nan,
+            'vel_redilatacion_px_s': v[i_min:].max() if contraccion else v[post[0]:i_max + 1].max()}
+
+
+def guardar_parametros(nombre_video, p):
+    #3.e) Los parametros de cada registro se guardan en un CSV comun (se reemplaza la fila si el video ya estaba)
+    #     para calcular la variabilidad entre registros (trials)
+    os.makedirs(CARPETA_RESULTADOS, exist_ok=True)
+    ruta = os.path.join(CARPETA_RESULTADOS, "parametros_registros.csv")
+    filas = []
+    if os.path.exists(ruta):
+        with open(ruta, newline='', encoding='utf-8') as f:
+            filas = [r for r in csv.DictReader(f) if r['video'] != nombre_video]
+    filas.append({'video': nombre_video, **{k: (f"{v:.4f}" if isinstance(v, float) else v) for k, v in p.items()}})
+    with open(ruta, 'w', newline='', encoding='utf-8') as f:
+        e = csv.DictWriter(f, fieldnames=list(filas[-1].keys()))
+        e.writeheader()
+        e.writerows(filas)
+    return ruta, filas
+
+
+def consigna_6_parametros(config):
+    print("\n PARTE 3.2 - Consigna 3: Parámetros fisiológicos")
+    medicion = obtener_medicion(config)
+    nombre_video = os.path.splitext(os.path.basename(config['video_path']))[0]
+    t = medicion['tiempo_s']
+    d, a, ok = limpiar_curva(medicion)
+    t_est, criterio = detectar_estimulo(config['video_path'], ok, medicion['fps'])
+    resp = input(f"     Estímulo detectado en t = {t_est:.2f} s ({criterio}). ENTER para aceptar o ingresá otro tiempo [s]: ").strip()
+    if resp:
+        t_est = float(resp.replace(',', '.'))
+
+    p = parametros_fisiologicos(t, d, a, t_est)
+    print(f"     Tipo de respuesta: {p['tipo']}")
+    print(f"3.a) Diámetro basal = {p['diametro_basal_px']:.1f} px")
+    print(f"3.b) Amplitud = {p['amplitud_diametro_px']:.1f} px (diámetro) | {p['amplitud_area_px']:.0f} px² (área)")
+    print(f"3.c) Tiempo de latencia = {1000 * p['latencia_s']:.0f} ms")
+    print(f"3.d) Velocidad de contracción = {p['vel_contraccion_px_s']:.1f} px/s | redilatación = {p['vel_redilatacion_px_s']:.1f} px/s")
+    ruta, filas = guardar_parametros(nombre_video, p)
+    print(f"     Curva guardada en: {guardar_curva_csv(medicion, nombre_video, d, a)} | Parámetros en: {ruta}")
+    filas = [f for f in filas if f['tipo'] == p['tipo']] #variabilidad solo entre registros del mismo tipo
+    if len(filas) >= 2:
+        print(f"3.e) Variabilidad entre {len(filas)} registros {p['tipo']} (media ± desvío):")
+        for clave, unidad in [('latencia_s', 's'), ('amplitud_diametro_px', 'px')]:
+            v = np.array([float(f[clave]) for f in filas])
+            print(f"     {clave}: {v.mean():.3f} ± {v.std(ddof=1):.3f} {unidad}")
+    else:
+        print("3.e) Para la variabilidad entre registros, procesá al menos 2 videos del mismo tipo.")
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.canvas.manager.set_window_title("Parte 3.2 - Consigna 3: Parámetros fisiológicos")
+    ax.plot(t[ok], medicion['diametro_px'][ok], '.', ms=3, color='0.6', label='D(t) medido')
+    ax.plot(t, d, '-', lw=2, color='tab:blue', label='D(t) interpolado y suavizado')
+    ax.axvline(t_est, color='orange', lw=2, label='Estímulo')
+    ax.axvline(t_est + p['latencia_s'], color='tab:purple', ls='--', label=f"Inicio de la respuesta (latencia {1000 * p['latencia_s']:.0f} ms)")
+    ax.axhline(p['diametro_basal_px'], color='k', ls=':', label='Diámetro basal')
+    ax.plot(p['t_extremo_s'], p['diametro_extremo_px'], 'v', ms=10, color='tab:green', label=f"Extremo (amplitud {p['amplitud_diametro_px']:.1f} px)")
+    ax.set_xlabel("Tiempo [s]"); ax.set_ylabel("Diámetro [px]"); ax.set_title(f"Registro {p['tipo']}")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+# =============================================================================
+# PARTE 3.2 - CONSIGNA 4: FUENTES DE ARTEFACTOS Y METODO DE FILTRADO
+# =============================================================================
+#Metodo implementado:
+# 1) DETECCION (frames_confiables): un frame es artefacto si cumple alguno de los criterios: parpadeo u oclusion,
+#    tamaño anomalo, movimiento ocular brusco, salto brusco o tramo corto entre artefactos.
+# 2) CORRECCION (limpiar_curva): esos frames se reemplazan por interpolacion lineal entre los frames confiables
+#    vecinos y la curva se suaviza con un filtro Savitzky-Golay (~0.3 s).
+
+def consigna_7_artefactos(config):
+    print("\n PARTE 3.2 - Consigna 4: Fuentes de artefactos y método de filtrado")
+    medicion = obtener_medicion(config)
+    t = medicion['tiempo_s']
+    ok, motivos = frames_confiables(medicion, devolver_motivos=True)
+    d_limpia = limpiar_curva(medicion)[0]
+    print(f"     Frames descartados: {(~ok).sum()} de {len(ok)} ({100 * (~ok).mean():.1f} %). Por fuente (un frame puede tener varias):")
+    for motivo, m in motivos.items():
+        print(f"       - {motivo:<30} {m.sum():>4} frames")
+
+    #Agrupamos los frames malos consecutivos en episodios, con el motivo mas frecuente de cada uno
+    episodios, i = [], 0
+    while i < len(ok):
+        j = i
+        while j < len(ok) and ok[j] == ok[i]:
+            j += 1
+        if not ok[i]:
+            episodios.append((t[i], t[j - 1], j - i, max(motivos, key=lambda m: motivos[m][i:j].sum())))
+        i = j
+    print(f"     Episodios de artefacto ({len(episodios)}):")
+    for ini, fin, n, motivo in episodios:
+        print(f"       {ini:6.2f} s - {fin:6.2f} s  ({n:>3} frames)  {motivo}")
+    print("     Método: los frames marcados se descartan y se reemplazan por interpolación lineal entre los")
+    print("     frames confiables vecinos; luego la curva se suaviza con un filtro Savitzky-Golay de ~0.3 s.")
+
+    fig, ax = plt.subplots(figsize=(12, 5))
+    fig.canvas.manager.set_window_title("Parte 3.2 - Consigna 4: Artefactos")
+    for k, (ini, fin, _, _) in enumerate(episodios):
+        ax.axvspan(ini, fin + 1 / medicion['fps'], color='tab:red', alpha=0.15, label='Episodio de artefacto' if k == 0 else None)
+    ax.plot(t, medicion['diametro_px'], '.', ms=3, color='0.6', label='D(t) crudo (todos los frames)')
+    ax.plot(t, d_limpia, '-', lw=2, color='tab:blue', label='D(t) sin artefactos (interpolado + suavizado)')
+    ajustar_escala(ax, medicion['diametro_px'][ok])
+    ax.set_xlabel("Tiempo [s]"); ax.set_ylabel("Diámetro [px]")
+    ax.legend(fontsize=8); ax.grid(alpha=0.3)
     plt.tight_layout()
     plt.show()
 
@@ -485,84 +787,25 @@ def ejecutar_modulo_3(config):
     print("\n==================================================")
     print("  EJECUTANDO MÓDULO 3: CARACTERÍSTICAS Y CURVA TEMPORAL")
     print("==================================================")
-
-    #Extrae los parametros del diccionario global del main
-    video_path = config['video_path']
-    roi = config['roi']
-    frame_idx = config.get('frame_idx', 0)
-
-    _, roi_rgb = cargar_frame_y_roi(video_path, frame_idx, roi)
-    roi_gris = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
-    roi_cuant = cuantizar(roi_gris) #ROI cuantizada a 64 niveles (se usa tambien en las consignas 2 y 3 de textura)
-
-    # ---------------- PARTE 3.1 ----------------
-    print("\n PARTE 3.1: Descriptores morfométricos y de textura en el frame segmentado")
-
-    #Paso previo: segmentacion
-    mascara, contorno = segmentar_pupila(roi_rgb)
-    if contorno is None:
-        print("[ERROR] No se encontró la pupila en este frame. Probá con otro frame o con otra ROI (opción 5 del menú).")
-        return
-
-    #Consigna 1: Descriptores morfometricos
-    morfo = descriptores_morfometricos(mascara, contorno)
-    print("\n Consigna 1: Descriptores morfométricos (forma)")
-    print("-" * 50)
-    print(f"1.a) Área (A):                 {morfo['area_px']:.0f} px")
-    print(f"     Perímetro (P):            {morfo['perimetro_px']:.1f} px")
-    print(f"1.b) Centroide (Xc, Yc):       ({morfo['centroide_x']:.1f}, {morfo['centroide_y']:.1f}) px")
-    print(f"1.c) Circularidad (4πA/P²):    {morfo['circularidad']:.3f}")
-    print(f"     Excentricidad:            {morfo['excentricidad']:.3f}")
-    print(f"     Diámetro equivalente:     {morfo['diametro_equivalente_px']:.1f} px")
-
-    graficar_morfometria(roi_rgb, roi_cuant, mascara, contorno, morfo)
-
-    #Consigna 2: Textura de primer orden
-    print("\n Consigna 2: Textura de primer orden (estadística global)")
-    mascara_iris, r_iris = mascara_del_iris(roi_gris, mascara, morfo)
-    if r_iris is None:
-        print("[AVISO] No se encontró el borde del iris; se usa un anillo de 2.5 veces el radio de la pupila.")
-    regiones = {'pupila': quitar_reflejos(mascara, roi_gris),
-                'iris': quitar_reflejos(mascara_iris, roi_gris)}
-    textura1, canales = textura_por_canal_y_region(roi_rgb, regiones)
-
-    print(f"Calculada sobre la ROI cuantizada a {NIVELES_GRIS} niveles, canal por canal")
-    print("-" * 66)
-    print(f"{'Región':<8} | {'Canal':<5} | {'Media':>7} | {'Desvío':>7} | {'Entropía':>8} | {'Skewness':>8}")
-    print("-" * 66)
-    for region in regiones:
-        for canal in ('R', 'G', 'B'):
-            d = textura1[region][canal]
-            print(f"{region:<8} | {canal:<5} | {d['media']:>7.2f} | {d['desvio']:>7.2f} | {d['entropia']:>8.3f} | {d['skewness']:>8.3f}")
-
-    graficar_textura_primer_orden(roi_rgb, regiones, textura1)
-
-    #Consigna 3: Textura de segundo orden (GLCM)
-    print("\n Consigna 3: Textura de segundo orden (GLCM, distancia 1, promedio de 0°/45°/90°/135°)")
-    textura2 = glcm_por_canal_y_region(canales, regiones)
-
-    print("-" * 72)
-    print(f"{'Región':<8} | {'Canal':<5} | {'Contraste':>9} | {'Homogen.':>8} | {'Energía':>8} | {'Correlación':>11}")
-    print("-" * 72)
-    for region in regiones:
-        for canal in ('R', 'G', 'B'):
-            a = textura2[region][canal]['atributos']
-            print(f"{region:<8} | {canal:<5} | {a['contraste']:>9.3f} | {a['homogeneidad']:>8.3f} | {a['energia']:>8.4f} | {a['correlacion']:>11.3f}")
-
-    canal_rico, ganadores = canal_mas_rico_en_textura(textura2, 'iris')
-    print("\n3.c) Riqueza textural del estroma iridiano:")
-    for criterio, canal in ganadores.items():
-        print(f"     - {criterio}: canal {canal}")
-    print(f"     => Canal con mayor riqueza textural en el iris: {canal_rico}")
-    contrastes = [textura2['iris'][c]['atributos']['contraste'] for c in ('R', 'G', 'B')]
-    dif_relativa = 100 * (max(contrastes) - min(contrastes)) / max(contrastes)
-    print(f"     (diferencia de contraste entre el mejor y el peor canal: {dif_relativa:.1f} %)")
-
-    print(f"     (diferencia de contraste entre el mejor y el peor canal: {dif_relativa:.1f} %)")
-
-    #Discusion 3.c: que canal aporta mayor riqueza textural del estroma iridiano
-    print(f"\n     Discusión: el canal {canal_rico} muestra la mayor riqueza textural del iris, pero la diferencia entre canales")
-    print(f"     es de solo {dif_relativa:.1f} %, porque el iris es claro y poco saturado y la compresión del video (H.264)")
-    print("     guarda el color a menor resolución que el brillo, así que los tres canales comparten casi la misma textura fina.")
-
-    graficar_glcm(textura2, 'iris')
+    opciones = {
+        "1": ("Parte 3.1 - Consigna 1: Descriptores morfométricos", consigna_1_morfometria),
+        "2": ("Parte 3.1 - Consigna 2: Textura de primer orden", consigna_2_primer_orden),
+        "3": ("Parte 3.1 - Consigna 3: Textura de segundo orden (GLCM)", consigna_3_glcm),
+        "4": ("Parte 3.2 - Consigna 1: Segmentación frame a frame y validación (MAE/RMSE)", consigna_4_validacion),
+        "5": ("Parte 3.2 - Consigna 2: Curva temporal D(t) y A(t)", consigna_5_curva),
+        "6": ("Parte 3.2 - Consigna 3: Parámetros fisiológicos", consigna_6_parametros),
+        "7": ("Parte 3.2 - Consigna 4: Fuentes de artefactos y método de filtrado", consigna_7_artefactos),
+    }
+    while True:
+        print("\n--------------------------------------------------")
+        print(f" Frame de trabajo (Parte 3.1): {config.get('frame_idx', 0)}")
+        for num, (texto, _) in opciones.items():
+            print(f"{num}. {texto}")
+        print("0. Volver al menú principal")
+        opcion = input("Seleccione una opción: ").strip()
+        if opcion == "0":
+            return
+        if opcion in opciones:
+            opciones[opcion][1](config)
+        else:
+            print("Opción inválida.")
