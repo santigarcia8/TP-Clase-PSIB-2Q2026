@@ -1,12 +1,14 @@
 #Modulo 2: Segmentacion y morfologia matematica de la pupila
 #Modulo 2.1: Algoritmos de segmentacion
 import cv2
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from skimage.segmentation import active_contour
 from skimage.filters import gaussian
 from skimage.segmentation import watershed
 from skimage.filters import sobel
+from skimage.morphology import skeletonize
 
 def lectura_frame(video_path, num_frame=0, roi_coords=None):
     cap = cv2.VideoCapture(video_path) #abre el archivo desde el path dado
@@ -209,8 +211,60 @@ def edac(mascara):
     
     return erosion, dilatacion, apertura, cierre
 
+def esqueletizacion(mascara, erosion, roi_rgb):
+    esq_area = skeletonize(mascara > 0) #deja la marca blanca de la pupila en una línea de 1 píxel
+    borde = cv2.subtract(mascara, erosion) #resto la máscara la parte erosionada y me queda un anillo
+    esq_borde = skeletonize(borde > 0) #hago que tenga 1 píxel todo el borde
     
+    sobre_area = roi_rgb.copy();   sobre_area[esq_area] = (255, 0, 0)    #pongo en rojo el contorno
+    sobre_borde = roi_rgb.copy();  sobre_borde[esq_borde] = (0, 255, 0)  #pongo en verde el otro borde
+
+    fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+    ax[0].imshow(mascara, cmap="gray"); ax[0].set_title("Máscara")
+    ax[1].imshow(sobre_area);              ax[1].set_title("Esqueleto del área")
+    ax[2].imshow(sobre_borde);             ax[2].set_title("Esqueleto del contorno")
+    for a in ax:
+        a.axis("off")
+    plt.show()
+
+    return esq_area, esq_borde
     
+def anotar_pupila(roi_rgb, frame_idx):
+    ruta = f"gt_frame{frame_idx}.png"
+
+    # Si ya lo hice este frame, lo leo del disco y listo
+    if os.path.exists(ruta):
+        gt = cv2.imread(ruta, 0)
+        if gt.shape == roi_rgb.shape[:2]:
+            return gt
+
+    #Pongo la imagen para hacer clics
+    plt.imshow(roi_rgb)
+    plt.title("Clic alrededor de la pupila. Enter = terminar")
+    puntos = plt.ginput(n=-1, timeout=-1)
+    plt.close()
+
+    #binarización de lo que reslta de los puntos
+    gt = np.zeros(roi_rgb.shape[:2], np.uint8)
+    cv2.fillPoly(gt, [np.array(puntos, dtype=np.int32)], 255)
+
+    #la guardo
+    cv2.imwrite(ruta, gt)
+    return gt
+
+def dice(a, b):
+    a = a > 0                      # blanco = True, negro = False
+    b = b > 0
+    interseccion = (a & b).sum()   # píxeles blancos en las dos
+    return 2 * interseccion / (a.sum() + b.sum())
+
+
+def iou(a, b):
+    a = a > 0
+    b = b > 0
+    interseccion = (a & b).sum()   # blancos en las dos
+    union = (a | b).sum()          # blancos en al menos una
+    return interseccion / union
 
 def ejecutar_modulo_2(config):
 
@@ -287,4 +341,22 @@ def ejecutar_modulo_2(config):
     
     mascara_erosionada, mascara_dilatada, mascara_apertura, mascara_cierre = edac(mascara=mascara)
     
+    esq_area, esq_borde = esqueletizacion(mascara=mascara, erosion=mascara_erosionada, roi_rgb=roi_rgb)
     
+    print("Ejecutando la comparación entre las máscaras y la pupila")
+    gt = anotar_pupila(roi_rgb=roi_rgb, frame_idx=frame_idx) #funcion para marcar con el mouse donde es pupila
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) #defino el kernel para comparar
+
+    candidatos = { #hafo todas las combinaciones posibles
+        "Sin limpiar": mascara,
+        "Apertura": cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel),
+        "Cierre": cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel),
+        "Apertura → Cierre": cv2.morphologyEx(
+            cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel), cv2.MORPH_CLOSE, kernel),
+        "Cierre → Apertura": cv2.morphologyEx(
+            cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel), cv2.MORPH_OPEN, kernel),
+    }
+
+    print(f"{'Método':<22}{'Dice':>8}{'IoU':>8}")
+    for nombre, m in candidatos.items(): #uso las funciones e imprmo los valores para analizar comparativamente
+        print(f"{nombre:<22}{dice(m, gt):>8.3f}{iou(m, gt):>8.3f}")
