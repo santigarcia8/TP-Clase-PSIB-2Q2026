@@ -65,7 +65,7 @@ def rellenar(forma, contorno):
 #Idea: la pupila es la region MAS OSCURA, REDONDA, con MUCHO CONTRASTE contra el iris y con un BORDE NITIDO.
 #Las pestañas y las sombras de la piel tambien son oscuras, pero son finas, alargadas o tocan el borde de la ROI.
 
-def puntuar_mancha(contorno, gris, gradiente):
+def puntuar_mancha(contorno, gris, gradiente, previa=None, niveles=None):
     #Puntaje de una mancha oscura segun cuanto se parece a una pupila (None si se descarta)
     h, w = gris.shape
     area = cv2.contourArea(contorno)
@@ -84,12 +84,31 @@ def puntuar_mancha(contorno, gris, gradiente):
     if not anillo.any():
         return None
     contraste = max(gris[anillo > 0].mean() - gris[adentro > 0].mean(), 0) #brillo alrededor - brillo adentro
+    #Oscuridad: la pupila es de lo mas oscuro de la ROI (1 = tan oscura como el 1% mas oscuro, 0 = como la mediana).
+    #Las cejas, el iris marron o las sombras son oscuros pero no tanto, porque mezclan pelos, tejido o piel
+    p1, p50 = niveles if niveles is not None else np.percentile(gris, (1, 50))
+    oscuridad = np.clip((p50 - np.median(gris[adentro > 0])) / max(p50 - p1, 1), 0, 1)
     borde = cv2.findContours(adentro, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0][0][:, 0, :]
     nitidez = gradiente[borde[:, 1], borde[:, 0]].mean() #gradiente medio sobre el borde
 
     bx, by, bw, bh = cv2.boundingRect(env)
     toca_borde = bx <= 1 or by <= 1 or bx + bw >= w - 1 or by + bh >= h - 1
-    puntaje = circularidad ** 2 * llenado ** 2 * solidez * contraste * nitidez * (0.3 if toca_borde else 1)
+    tamaño = area / (area + 0.002 * h * w)                   #las manchitas diminutas (pelos, poros) pesan menos
+    #Contexto de ojo: a los costados de la pupila (±30° de la horizontal) primero esta el iris y mas afuera la
+    #esclerotica, que es clara. Medimos cuanto sube el brillo a lo largo de esos rayos (hasta 8 radios). Un pelo o
+    #una sombra sobre la piel tiene alrededor un brillo parejo, asi que este termino lo distingue de una pupila
+    ang = np.r_[np.linspace(-np.pi / 6, np.pi / 6, 7), np.linspace(5 * np.pi / 6, 7 * np.pi / 6, 7)]
+    rad = np.arange(1.3 * r, 8 * r, max(1.0, r / 4))
+    xs = np.clip(x + np.outer(np.cos(ang), rad), 0, w - 1).astype(int)
+    ys = np.clip(y + np.outer(np.sin(ang), rad), 0, h - 1).astype(int)
+    perfil = gris[ys, xs].astype(float).mean(axis=0)
+    esclera = max(perfil[np.argmin(perfil):].max() - perfil.min(), 0) if perfil.size else 0
+    centrado = 1 / (1 + 2 * np.hypot(x - w / 2, y - h / 2) / np.hypot(w, h)) #la ROI se dibuja alrededor del ojo
+    puntaje = (circularidad ** 2 * llenado ** 2 * solidez * contraste * nitidez * tamaño * centrado
+               * (1 + esclera / 25) * oscuridad ** 3 * (0.3 if toca_borde else 1))
+    if previa is not None: #en video: la pupila casi no se mueve ni cambia de tamaño de un frame al siguiente
+        px, py, pr = previa
+        puntaje *= 1 / (1 + (np.hypot(x - px, y - py) / (2 * pr)) ** 2) * np.exp(-abs(np.log(np.sqrt(area_env / np.pi) / pr)))
     return {'puntaje': puntaje, 'envolvente': env, 'centro': (float(x), float(y)), 'area': area_env}
 
 
@@ -106,19 +125,21 @@ def elegir_pupila(candidatas, tolerancia=0.6):
     return min(anidadas, key=lambda c: c['area'])
 
 
-def segmentar_pupila(roi_rgb):
-    #Devuelve la mascara de la pupila (0/255) y su contorno, o (mascara vacia, None) si no la encuentra
+def segmentar_pupila(roi_rgb, previa=None):
+    #Devuelve la mascara de la pupila (0/255) y su contorno, o (mascara vacia, None) si no la encuentra.
+    #'previa' = (x, y, radio) de la pupila en los frames anteriores (solo en video), para no saltar a otra mancha
     gris = cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY)
     suave = cv2.medianBlur(gris, 5) #la mediana saca ruido impulsivo sin borronear el borde
     h, w = gris.shape
     gradiente = np.hypot(cv2.Sobel(suave, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(suave, cv2.CV_32F, 0, 1, ksize=3))
     k = max(3, int(min(h, w) / 80)) #kernel proporcional al tamaño de la ROI (impar)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k + (k % 2 == 0),) * 2)
+    niveles = np.percentile(suave, (1, 50)) #se calculan una vez para todas las manchas
 
     def candidatas_de(binaria):
         binaria = cv2.morphologyEx(binaria, cv2.MORPH_OPEN, kernel)  #apertura: borra pestañas finas y puntitos
         binaria = cv2.morphologyEx(binaria, cv2.MORPH_CLOSE, kernel) #cierre: tapa huecos chicos (reflejos)
-        puntuadas = [puntuar_mancha(c, suave, gradiente)
+        puntuadas = [puntuar_mancha(c, suave, gradiente, previa, niveles)
                      for c in cv2.findContours(binaria, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0]]
         return [p for p in puntuadas if p is not None]
 
@@ -146,7 +167,56 @@ def segmentar_pupila(roi_rgb):
         elegida = sub
 
     #Paso 3: mascara = envolvente convexa (la pupila es convexa: se rellenan los "mordiscos" de los reflejos)
-    return rellenar((h, w), elegida['envolvente']), elegida['envolvente']
+    contorno = completar_con_circulo(elegida, gradiente, (h, w))
+    return rellenar((h, w), contorno), contorno
+
+
+def completar_con_circulo(elegida, gradiente, forma):
+    #Si un reflejo "vela" parte de la pupila, la mancha oscura queda recortada de ese lado. Como la pupila es redonda,
+    #ajustamos un circulo (minimos cuadrados) a los puntos del borde con gradiente fuerte (el borde real pupila-iris)
+    #y nos quedamos con la union de la mancha y ese circulo. Si el circulo no es razonable, queda la mancha.
+    env = elegida['envolvente']
+    borde = cv2.findContours(rellenar(forma, env), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0][0][:, 0, :].astype(float)
+    g = gradiente[borde[:, 1].astype(int), borde[:, 0].astype(int)]
+    fuertes = borde[g >= np.percentile(g, 40)]
+    if len(fuertes) < 10:
+        return env
+    #circulo por minimos cuadrados: x^2 + y^2 = 2a x + 2b y + c
+    A = np.c_[2 * fuertes, np.ones(len(fuertes))]
+    (a, b, c), *_ = np.linalg.lstsq(A, (fuertes ** 2).sum(axis=1), rcond=None)
+    radio = np.sqrt(c + a ** 2 + b ** 2)
+    r_mancha = np.sqrt(elegida['area'] / np.pi)
+    if not (0.9 * r_mancha <= radio <= 1.4 * r_mancha) or np.hypot(a - elegida['centro'][0], b - elegida['centro'][1]) > 0.5 * r_mancha:
+        return env
+    union = rellenar(forma, env)
+    union[circulo(forma, (round(a), round(b)), radio) > 0] = 255
+    return cv2.convexHull(max(cv2.findContours(union, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)[0], key=cv2.contourArea))
+
+
+def referencia_pupila(video_path, roi, frame_centro, n=11, ventana_s=1.0):
+    #Consenso entre frames: segmenta n frames cercanos (±1 s) y se queda con la ubicacion y el tamaño en los que
+    #coinciden la mayoria. La pupila aparece siempre en el mismo lugar; los errores (cejas, letras, sombras) van
+    #cambiando de un frame a otro. Devuelve (x, y, radio) o None si no hay acuerdo suficiente.
+    cap = cv2.VideoCapture(video_path)
+    fps, total = cap.get(cv2.CAP_PROP_FPS) or 30.0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    detecciones = []
+    for fr in np.linspace(max(0, frame_centro - ventana_s * fps), min(total - 1, frame_centro + ventana_s * fps), n).astype(int):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(fr))
+        ok, frame_bgr = cap.read()
+        if not ok:
+            continue
+        mascara, contorno = segmentar_pupila(recortar(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), roi))
+        if contorno is not None:
+            m = descriptores_morfometricos(mascara, contorno)
+            detecciones.append((m['centroide_x'], m['centroide_y'], m['diametro_equivalente_px'] / 2))
+    cap.release()
+    if not detecciones:
+        return None
+    det = np.array(detecciones)
+    #cada deteccion "vota" por las que estan cerca (menos de 1.5 radios) y tienen un tamaño parecido
+    apoyos = [(np.hypot(det[:, 0] - x, det[:, 1] - y) < 1.5 * r) & (np.abs(np.log(det[:, 2] / r)) < 0.4) for x, y, r in det]
+    mejor = max(apoyos, key=np.sum)
+    return tuple(np.median(det[mejor], axis=0)) if mejor.sum() >= max(3, n // 3) else None
 
 
 def preparar_frame(config):
@@ -155,7 +225,8 @@ def preparar_frame(config):
     clave = (config['video_path'], config.get('frame_idx', 0), tuple(config['roi']) if config['roi'] else None)
     if config.get('frame_m3', {}).get('clave') != clave:
         _, roi_rgb = cargar_frame_y_roi(config['video_path'], config.get('frame_idx', 0), config['roi'])
-        mascara, contorno = segmentar_pupila(roi_rgb)
+        referencia = referencia_pupila(config['video_path'], config['roi'], config.get('frame_idx', 0))
+        mascara, contorno = segmentar_pupila(roi_rgb, referencia)
         config['frame_m3'] = {'clave': clave, 'roi_rgb': roi_rgb, 'roi_gris': cv2.cvtColor(roi_rgb, cv2.COLOR_RGB2GRAY),
                               'mascara': mascara, 'contorno': contorno}
     f = config['frame_m3']
@@ -369,9 +440,14 @@ def consigna_3_glcm(config):
     dif_relativa = 100 * (max(contrastes) - min(contrastes)) / max(contrastes)
     print("\n3.c) Riqueza textural del estroma iridiano: " + " | ".join(f"{k}: {v}" for k, v in ganadores.items()))
     print(f"     => Canal con mayor riqueza textural: {canal_rico} (diferencia de contraste entre canales: {dif_relativa:.1f} %)")
-    print(f"     Discusión: el canal {canal_rico} muestra la mayor riqueza textural del iris, pero la diferencia entre canales")
-    print(f"     es de solo {dif_relativa:.1f} %, porque el iris es claro y poco saturado y la compresión del video (H.264)")
-    print("     guarda el color a menor resolución que el brillo, así que los tres canales comparten casi la misma textura fina.")
+    if dif_relativa < 10:
+        print(f"     Discusión: la diferencia entre canales es chica ({dif_relativa:.1f} %): en un iris claro y poco saturado R, G y B varían")
+        print("     casi juntos, y la compresión del video (H.264) guarda el color a menor resolución que el brillo, así que los")
+        print("     tres canales comparten casi la misma textura fina. No se puede afirmar que un canal sea claramente mejor.")
+    else:
+        print(f"     Discusión: el canal {canal_rico} aporta claramente más textura ({dif_relativa:.1f} % más contraste). En iris pigmentados")
+        print("     (marrones) la melanina del estroma absorbe el azul y el verde, por eso esos canales quedan oscuros y con poco")
+        print("     contraste, mientras que en el rojo se ven mejor las fibras y criptas del estroma.")
 
     fig, ax = plt.subplots(2, 4, figsize=(18, 8.5))
     fig.canvas.manager.set_window_title("Parte 3.1 - Consigna 3: Textura de segundo orden (GLCM)")
@@ -407,14 +483,19 @@ def medir_video_frame_a_frame(video_path, roi):
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0 #si el video no trae los fps, asumimos 30
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     claves = ('area_px', 'diametro_equivalente_px', 'circularidad', 'centroide_x', 'centroide_y')
-    filas = []
+    inicial = referencia_pupila(video_path, roi, int(fps)) #consenso en los primeros 2 s para arrancar el seguimiento
+    filas, recientes = [], []
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
-        mascara, contorno = segmentar_pupila(recortar(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), roi))
+        #referencia = mediana de las ultimas 15 detecciones (la mediana no se deja arrastrar por un frame erroneo)
+        previa = tuple(np.median(recientes[-15:], axis=0)) if len(recientes) >= 5 else inicial
+        mascara, contorno = segmentar_pupila(recortar(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), roi), previa)
         morfo = descriptores_morfometricos(mascara, contorno) if contorno is not None else {}
         filas.append([morfo.get(k, np.nan) for k in claves])
+        if morfo:
+            recientes.append((morfo['centroide_x'], morfo['centroide_y'], morfo['diametro_equivalente_px'] / 2))
         if len(filas) % 30 == 0:
             print(f"\r     Procesando frame {len(filas)}/{total}...", end="")
     cap.release()
@@ -456,19 +537,38 @@ def frames_confiables(medicion, circ_min=0.8, salto_max=0.2, devolver_motivos=Fa
     #interpolacion (consignas 3 y 4). Cada criterio corresponde a una fuente de artefacto:
     d = np.nan_to_num(medicion['diametro_px'])
     mediana = np.nanmedian(medicion['diametro_px'])
-    mediana_movil = medfilt(d, int(medicion['fps'] / 2) // 2 * 2 + 1) #mediana de los vecinos (~0.5 s)
-    desplazamiento = np.r_[0, np.hypot(np.diff(medicion['centroide_x']), np.diff(medicion['centroide_y']))]
+    circ = np.nan_to_num(medicion['circularidad'])
+    #mediana de los vecinos (~0.25 s a cada lado, sin el propio frame), calculada solo con frames que pasan los otros
+    #criterios: si no, una zona de detecciones erroneas "arrastra" la mediana y deja pasar frames malos
+    previos = medicion['encontrada'] & (circ >= circ_min) & (d >= 0.5 * mediana) & (d <= 2 * mediana)
+    mitad = int(medicion['fps'] / 4)
+    mediana_movil = d.copy()
+    for i in range(len(d)):
+        vecinos = [d[j] for j in range(max(0, i - mitad), min(len(d), i + mitad + 1)) if j != i and previos[j]]
+        if len(vecinos) >= 3:
+            mediana_movil[i] = np.median(vecinos)
+    paso = np.hypot(np.diff(medicion['centroide_x']), np.diff(medicion['centroide_y']))
+    paso = np.nan_to_num(paso, nan=np.inf)
+    desplazamiento = np.minimum(np.r_[np.inf, paso], np.r_[paso, np.inf]) #distancia al frame anterior Y al siguiente
     motivos = {
         #parpadeo / ojo cerrado: no hay pupila, o el parpado la tapa en parte y deja de ser redonda
-        'parpadeo u oclusion': ~medicion['encontrada'] | (np.nan_to_num(medicion['circularidad']) < circ_min),
+        'parpadeo u oclusion': ~medicion['encontrada'] | (circ < circ_min),
         #ojo fuera de cuadro o segmentacion erronea: tamaño muy distinto al habitual del video
         'tamaño anomalo': (d < 0.5 * mediana) | (d > 2 * mediana),
-        #movimiento ocular brusco: el centro de la pupila salta mas de medio radio entre dos frames
-        'movimiento ocular': np.nan_to_num(desplazamiento, nan=np.inf) > 0.5 * np.maximum(d / 2, 1),
+        #movimiento ocular brusco: el centro de la pupila esta a mas de medio radio del frame anterior y del siguiente
+        #(un frame borroso en medio de un movimiento rapido, o una deteccion suelta en otro lugar)
+        'movimiento ocular': desplazamiento > 0.5 * np.maximum(d / 2, 1),
         #ruido de segmentacion: el diametro salta mas de un 20% respecto de los frames vecinos
         'salto brusco': np.abs(d - mediana_movil) > salto_max * mediana_movil,
     }
     ok = ~np.any(list(motivos.values()), axis=0)
+    #margen: los frames pegados a un artefacto (~0.1 s antes y despues) suelen estar "medio contaminados"
+    #(el parpado empezando a bajar, el ojo terminando de moverse), asi que tambien se descartan
+    m = max(1, int(0.1 * medicion['fps']))
+    margen = ok & ~(cv2.erode(ok.astype(np.uint8).reshape(1, -1), np.ones((1, 2 * m + 1), np.uint8),
+                              borderType=cv2.BORDER_REPLICATE).ravel().astype(bool))
+    motivos['margen alrededor de un artefacto'] = margen
+    ok &= ~margen
     #tramos de frames "buenos" de menos de medio segundo en medio de una zona mala tambien se descartan
     tramo_corto = np.zeros_like(ok)
     i = 0
@@ -500,8 +600,10 @@ def anotar_frame_manual(roi_rgb, titulo):
         if len(puntos) >= 5: #con 5 puntos ya se puede ajustar una elipse: la mostramos
             (cx, cy), (e1, e2), ang = cv2.fitEllipse(np.array(puntos, np.float32))
             cv2.ellipse(vista, ((cx * escala, cy * escala), (e1 * escala, e2 * escala), ang), (0, 255, 255), 1)
-        cv2.putText(vista, f"Puntos: {len(puntos)} | ENTER aceptar | r borrar | s saltear | ESC terminar",
+        cv2.putText(vista, "Marca el borde de la PUPILA (circulo negro del centro), NO el del iris",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.putText(vista, f"Puntos: {len(puntos)} | ENTER aceptar | r borrar | s saltear | ESC terminar",
+                    (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         cv2.imshow(titulo, vista)
         tecla = cv2.waitKey(20) & 0xFF
         if tecla in (13, 10) and len(puntos) >= 5:
@@ -529,8 +631,13 @@ def anotaciones_manuales(config, medicion, nombre_video):
     print("     Hacé click en al menos 5 puntos del borde de la pupila y ENTER (r borrar, s saltear, ESC terminar).")
     anot = {}
     for k, fr in enumerate(elegidos):
-        r = anotar_frame_manual(cargar_frame_y_roi(config['video_path'], int(fr), config['roi'])[1],
-                                f"Anotacion manual {k + 1}/{len(elegidos)} - frame {fr}")
+        #se muestra la zona alrededor de la pupila (4 radios) agrandada, para que el circulo negro se vea grande
+        #(el area y el diametro no dependen de donde este el recorte)
+        roi_rgb = cargar_frame_y_roi(config['video_path'], int(fr), config['roi'])[1]
+        x, y, r = medicion['centroide_x'][fr], medicion['centroide_y'][fr], medicion['diametro_px'][fr] / 2
+        lado = int(max(4 * r, 40))
+        recorte = roi_rgb[max(int(y) - lado, 0):int(y) + lado, max(int(x) - lado, 0):int(x) + lado]
+        r = anotar_frame_manual(recorte, f"Anotacion manual {k + 1}/{len(elegidos)} - frame {fr}")
         if r == 'terminar':
             break
         if r is not None:
@@ -642,10 +749,22 @@ def detectar_estimulo(video_path, ok, fps):
             break
         brillo.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).mean())
     cap.release()
-    saltos = np.abs(np.diff(medfilt(np.array(brillo), 3)))
-    if saltos.max() > 15: #salto claro (en niveles de gris)
-        return (np.argmax(saltos) + 1) / fps, "salto de brillo (luz)"
-    return np.argmax(ok) / fps, "apertura del ojo (primer frame confiable)"
+    #Cambio de brillo en ventanas de ~0.25 s (la camara ajusta la exposicion, asi que el cambio puede no ser instantaneo)
+    brillo = medfilt(np.array(brillo), 3)
+    k = max(1, int(0.25 * fps))
+    cambio = brillo[k:] - brillo[:-k]
+    #solo se buscan cambios mientras se ve el ojo (entre el primer y el ultimo frame confiable): al principio o al
+    #final del video la camara suele moverse y el brillo cambia sin que haya un estimulo
+    validos = np.flatnonzero(ok)
+    cambio[:max(validos[0] - k, 0)] = 0
+    cambio[max(validos[-1] - k, 0):] = 0
+    i = int(np.argmax(np.abs(cambio)))
+    if abs(cambio[i]) > 15: #cambio claro (en niveles de gris): el estimulo es el frame donde el brillo cambia mas rapido
+        j = i + int(np.argmax(np.abs(np.diff(brillo[i:i + k + 1]))))
+        return (j + 1) / fps, "cambio de brillo (luz " + ("prendida)" if cambio[i] > 0 else "apagada)")
+    if np.argmax(ok) > 0:
+        return np.argmax(ok) / fps, "apertura del ojo (primer frame confiable)"
+    return 0.0, "NO se detectó estímulo: ni cambio de luz ni apertura del ojo. Si lo conocés, ingresalo a mano"
 
 
 def parametros_fisiologicos(t, d, a, t_est):
@@ -706,6 +825,10 @@ def consigna_6_parametros(config):
     print(f"3.a) Diámetro basal = {p['diametro_basal_px']:.1f} px")
     print(f"3.b) Amplitud = {p['amplitud_diametro_px']:.1f} px (diámetro) | {p['amplitud_area_px']:.0f} px² (área)")
     print(f"3.c) Tiempo de latencia = {1000 * p['latencia_s']:.0f} ms")
+    sin_medir = 1 - ok[(t >= t_est) & (t <= t_est + 0.5)].mean() #fraccion de artefactos justo despues del estimulo
+    if sin_medir > 0.5:
+        print(f"     [AVISO] La latencia no es confiable: el {100 * sin_medir:.0f} % de los frames en los 0.5 s posteriores")
+        print("     al estímulo son artefactos (ej: la cámara ajustando la exposición), así que esa parte de la curva es interpolada.")
     print(f"3.d) Velocidad de contracción = {p['vel_contraccion_px_s']:.1f} px/s | redilatación = {p['vel_redilatacion_px_s']:.1f} px/s")
     ruta, filas = guardar_parametros(nombre_video, p)
     print(f"     Curva guardada en: {guardar_curva_csv(medicion, nombre_video, d, a)} | Parámetros en: {ruta}")
@@ -737,7 +860,8 @@ def consigna_6_parametros(config):
 # =============================================================================
 #Metodo implementado:
 # 1) DETECCION (frames_confiables): un frame es artefacto si cumple alguno de los criterios: parpadeo u oclusion,
-#    tamaño anomalo, movimiento ocular brusco, salto brusco o tramo corto entre artefactos.
+#    tamaño anomalo, movimiento ocular brusco o salto brusco; ademas se descarta un margen de ~0.1 s alrededor de
+#    cada artefacto y los tramos cortos de frames buenos entre artefactos.
 # 2) CORRECCION (limpiar_curva): esos frames se reemplazan por interpolacion lineal entre los frames confiables
 #    vecinos y la curva se suaviza con un filtro Savitzky-Golay (~0.3 s).
 
