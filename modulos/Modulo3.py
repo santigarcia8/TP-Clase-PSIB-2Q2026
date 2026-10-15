@@ -104,8 +104,21 @@ def puntuar_mancha(contorno, gris, gradiente, previa=None, niveles=None):
     perfil = gris[ys, xs].astype(float).mean(axis=0)
     esclera = max(perfil[np.argmin(perfil):].max() - perfil.min(), 0) if perfil.size else 0
     centrado = 1 / (1 + 2 * np.hypot(x - w / 2, y - h / 2) / np.hypot(w, h)) #la ROI se dibuja alrededor del ojo
+    #Iris concentrico: alrededor de la pupila esta el iris, y su borde con la esclerotica (blanca) aparece A LA MISMA
+    #DISTANCIA hacia la izquierda y hacia la derecha (entre 2 y 6 radios). Alrededor de una letra, un pelo o una sombra
+    #los bordes que aparecen estan a distancias desparejas o son debiles
+    radios = np.arange(2 * r, 6 * r, max(1.0, r / 4))
+    bordes = []
+    for centro_ang in (0, np.pi):
+        ang = centro_ang + np.linspace(-np.pi / 6, np.pi / 6, 9)
+        xs = np.clip(x + np.outer(np.cos(ang), radios), 0, w - 1).astype(int)
+        ys = np.clip(y + np.outer(np.sin(ang), radios), 0, h - 1).astype(int)
+        derivada = np.diff(gris[ys, xs].astype(float).mean(axis=0)) if radios.size > 2 else np.zeros(1)
+        bordes.append((derivada.max(), radios[np.argmax(derivada)]))
+    (fuerza_d, radio_d), (fuerza_i, radio_i) = bordes
+    iris = min(fuerza_d, fuerza_i) if abs(radio_d - radio_i) < 0.3 * max(radio_d, radio_i) else 0.0
     puntaje = (circularidad ** 2 * llenado ** 2 * solidez * contraste * nitidez * tamaño * centrado
-               * (1 + esclera / 25) * oscuridad ** 3 * (0.3 if toca_borde else 1))
+               * (1 + esclera / 25) * oscuridad ** 3 * (1 + max(iris, 0) / 4) * (0.3 if toca_borde else 1))
     if previa is not None: #en video: la pupila casi no se mueve ni cambia de tamaño de un frame al siguiente
         px, py, pr = previa
         puntaje *= 1 / (1 + (np.hypot(x - px, y - py) / (2 * pr)) ** 2) * np.exp(-abs(np.log(np.sqrt(area_env / np.pi) / pr)))
@@ -219,11 +232,25 @@ def referencia_pupila(video_path, roi, frame_centro, n=11, ventana_s=1.0):
     return tuple(np.median(det[mejor], axis=0)) if mejor.sum() >= max(3, n // 3) else None
 
 
+def avisar_si_roi_grande(config):
+    #Con el frame entero (o una ROI muy grande) aparecen objetos parecidos a una pupila (letras, pelo, sombras) y la
+    #deteccion puede fallar, sobre todo con ojos oscuros. Se avisa para que se dibuje la ROI alrededor del ojo
+    cap = cv2.VideoCapture(config['video_path'])
+    area_frame = cap.get(cv2.CAP_PROP_FRAME_WIDTH) * cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    cap.release()
+    roi = config['roi']
+    area_roi = area_frame if roi is None else (roi[1] - roi[0]) * (roi[3] - roi[2])
+    if area_roi > 0.4 * area_frame:
+        print("[AVISO] La ROI ocupa casi todo el frame: la pupila se puede confundir con otros objetos oscuros")
+        print("        (letras, pelo, sombras). Para mejores resultados, dibujá la ROI alrededor del ojo (opción 5 del menú).")
+
+
 def preparar_frame(config):
     #Segmenta el frame de trabajo una sola vez y lo reutiliza en las 3 consignas de la 3.1
     #(se vuelve a calcular si en el main se cambia el frame o la ROI)
     clave = (config['video_path'], config.get('frame_idx', 0), tuple(config['roi']) if config['roi'] else None)
     if config.get('frame_m3', {}).get('clave') != clave:
+        avisar_si_roi_grande(config)
         _, roi_rgb = cargar_frame_y_roi(config['video_path'], config.get('frame_idx', 0), config['roi'])
         referencia = referencia_pupila(config['video_path'], config['roi'], config.get('frame_idx', 0))
         mascara, contorno = segmentar_pupila(roi_rgb, referencia)
@@ -484,11 +511,12 @@ def medir_video_frame_a_frame(video_path, roi):
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     claves = ('area_px', 'diametro_equivalente_px', 'circularidad', 'centroide_x', 'centroide_y')
     inicial = referencia_pupila(video_path, roi, int(fps)) #consenso en los primeros 2 s para arrancar el seguimiento
-    filas, recientes = [], []
+    filas, recientes, forma = [], [], None
     while True:
         ok, frame_bgr = cap.read()
         if not ok:
             break
+        forma = recortar(frame_bgr, roi).shape[:2]
         #referencia = mediana de las ultimas 15 detecciones (la mediana no se deja arrastrar por un frame erroneo)
         previa = tuple(np.median(recientes[-15:], axis=0)) if len(recientes) >= 5 else inicial
         mascara, contorno = segmentar_pupila(recortar(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB), roi), previa)
@@ -503,13 +531,14 @@ def medir_video_frame_a_frame(video_path, roi):
     datos = np.array(filas, dtype=float)
     return {'fps': fps, 'frame': np.arange(len(filas)), 'tiempo_s': np.arange(len(filas)) / fps,
             'area_px': datos[:, 0], 'diametro_px': datos[:, 1], 'circularidad': datos[:, 2],
-            'centroide_x': datos[:, 3], 'centroide_y': datos[:, 4], 'encontrada': ~np.isnan(datos[:, 0])}
+            'centroide_x': datos[:, 3], 'centroide_y': datos[:, 4], 'encontrada': ~np.isnan(datos[:, 0]), 'forma_roi': forma}
 
 
 def obtener_medicion(config):
     #Mide el video una sola vez y lo reutiliza en las 4 consignas de la 3.2 (se vuelve a medir si cambia la ROI)
     clave = (config['video_path'], tuple(config['roi']) if config['roi'] else None)
     if config.get('medicion_m3', {}).get('clave') != clave:
+        avisar_si_roi_grande(config)
         print("     Midiendo la pupila en todos los frames del video...")
         config['medicion_m3'] = medir_video_frame_a_frame(config['video_path'], config['roi'])
         config['medicion_m3']['clave'] = clave
@@ -541,12 +570,18 @@ def frames_confiables(medicion, circ_min=0.8, salto_max=0.2, devolver_motivos=Fa
     #mediana de los vecinos (~0.25 s a cada lado, sin el propio frame), calculada solo con frames que pasan los otros
     #criterios: si no, una zona de detecciones erroneas "arrastra" la mediana y deja pasar frames malos
     previos = medicion['encontrada'] & (circ >= circ_min) & (d >= 0.5 * mediana) & (d <= 2 * mediana)
-    mitad = int(medicion['fps'] / 4)
     mediana_movil = d.copy()
     for i in range(len(d)):
-        vecinos = [d[j] for j in range(max(0, i - mitad), min(len(d), i + mitad + 1)) if j != i and previos[j]]
-        if len(vecinos) >= 3:
-            mediana_movil[i] = np.median(vecinos)
+        for mitad in (int(medicion['fps'] / 4), int(medicion['fps'])): #si no hay vecinos validos cerca (ej: despues
+            vecinos = [d[j] for j in range(max(0, i - mitad), min(len(d), i + mitad + 1)) if j != i and previos[j]]
+            if len(vecinos) >= 3:                                       #de un hueco largo), se buscan hasta 1 s
+                mediana_movil[i] = np.median(vecinos)
+                break
+    h, w = medicion['forma_roi']
+    cx, cy = np.nan_to_num(medicion['centroide_x']), np.nan_to_num(medicion['centroide_y'])
+    #pupila cerca del borde de la ROI: a los costados hace falta lugar para el iris (2 radios); arriba y abajo
+    #alcanza con que la pupila entre completa (1 radio), porque ahi igual estan los parpados
+    en_borde = (np.minimum(cx, w - 1 - cx) < d) | (np.minimum(cy, h - 1 - cy) < d / 2)
     paso = np.hypot(np.diff(medicion['centroide_x']), np.diff(medicion['centroide_y']))
     paso = np.nan_to_num(paso, nan=np.inf)
     desplazamiento = np.minimum(np.r_[np.inf, paso], np.r_[paso, np.inf]) #distancia al frame anterior Y al siguiente
@@ -560,6 +595,8 @@ def frames_confiables(medicion, circ_min=0.8, salto_max=0.2, devolver_motivos=Fa
         'movimiento ocular': desplazamiento > 0.5 * np.maximum(d / 2, 1),
         #ruido de segmentacion: el diametro salta mas de un 20% respecto de los frames vecinos
         'salto brusco': np.abs(d - mediana_movil) > salto_max * mediana_movil,
+        #el ojo se movio hasta el borde de la ROI: parte del iris queda afuera y la segmentacion no es confiable
+        'pupila en el borde de la ROI': en_borde,
     }
     ok = ~np.any(list(motivos.values()), axis=0)
     #margen: los frames pegados a un artefacto (~0.1 s antes y despues) suelen estar "medio contaminados"
@@ -712,9 +749,11 @@ def consigna_5_curva(config):
           f"frames confiables: {ok.sum()} ({100 * ok.mean():.1f} %)")
     fig, ax = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
     fig.canvas.manager.set_window_title("Parte 3.2 - Consigna 2: Curva temporal")
-    for a, (clave, etiqueta) in zip(ax, [('diametro_px', 'Diámetro D(t) [px]'), ('area_px', 'Área A(t) [px²]')]):
-        a.plot(t[ok], medicion[clave][ok], '.-', ms=3, lw=1, color='tab:blue', label='Frames confiables')
-        a.plot(t[~ok], medicion[clave][~ok], 'x', ms=5, color='tab:red', label='Frames no confiables (artefactos, ver consigna 4)')
+    d_limpia, a_limpia, _ = limpiar_curva(medicion)
+    for a, (clave, etiqueta, limpia) in zip(ax, [('diametro_px', 'Diámetro D(t) [px]', d_limpia), ('area_px', 'Área A(t) [px²]', a_limpia)]):
+        a.plot(t[ok], medicion[clave][ok], '.', ms=3, color='0.55', label='Frames confiables (medición cruda)')
+        a.plot(t, limpia, '-', lw=2, color='tab:blue', label='Curva sin artefactos (interpolada y filtrada, ver consigna 4)')
+        a.plot(t[~ok], medicion[clave][~ok], 'x', ms=5, color='tab:red', label='Frames no confiables (artefactos)')
         ajustar_escala(a, medicion[clave][ok])
         a.set_ylabel(etiqueta); a.grid(alpha=0.3)
     ax[0].set_title(f"Curva temporal de la pupila - {os.path.basename(config['video_path'])}")
@@ -730,12 +769,13 @@ def consigna_5_curva(config):
 
 def limpiar_curva(medicion):
     #Metodo de correccion de artefactos (ver consigna 4): los frames no confiables se reemplazan por interpolacion
-    #lineal y la curva se suaviza con un filtro Savitzky-Golay (~0.3 s), que saca el ruido de la segmentacion
-    #sin aplanar la contraccion rapida
+    #lineal. Despues se aplica un filtro de mediana (~0.3 s), que elimina los saltos de uno o dos frames de la
+    #segmentacion sin redondear los cambios rapidos reales, y un filtro Savitzky-Golay (~0.3 s) que suaviza el resto
     ok = frames_confiables(medicion)
     t = medicion['tiempo_s']
     ventana = int(0.3 * medicion['fps']) // 2 * 2 + 1
-    return [savgol_filter(np.interp(t, t[ok], medicion[c][ok]), ventana, 2) for c in ('diametro_px', 'area_px')] + [ok]
+    return [savgol_filter(medfilt(np.interp(t, t[ok], medicion[c][ok]), ventana), ventana, 2)
+            for c in ('diametro_px', 'area_px')] + [ok]
 
 
 def detectar_estimulo(video_path, ok, fps):
@@ -860,10 +900,10 @@ def consigna_6_parametros(config):
 # =============================================================================
 #Metodo implementado:
 # 1) DETECCION (frames_confiables): un frame es artefacto si cumple alguno de los criterios: parpadeo u oclusion,
-#    tamaño anomalo, movimiento ocular brusco o salto brusco; ademas se descarta un margen de ~0.1 s alrededor de
+#    tamaño anomalo, movimiento ocular brusco, salto brusco o pupila en el borde de la ROI; ademas se descarta un margen de ~0.1 s alrededor de
 #    cada artefacto y los tramos cortos de frames buenos entre artefactos.
 # 2) CORRECCION (limpiar_curva): esos frames se reemplazan por interpolacion lineal entre los frames confiables
-#    vecinos y la curva se suaviza con un filtro Savitzky-Golay (~0.3 s).
+#    vecinos y la curva se filtra con una mediana (~0.3 s) y un Savitzky-Golay (~0.3 s).
 
 def consigna_7_artefactos(config):
     print("\n PARTE 3.2 - Consigna 4: Fuentes de artefactos y método de filtrado")
@@ -873,7 +913,7 @@ def consigna_7_artefactos(config):
     d_limpia = limpiar_curva(medicion)[0]
     print(f"     Frames descartados: {(~ok).sum()} de {len(ok)} ({100 * (~ok).mean():.1f} %). Por fuente (un frame puede tener varias):")
     for motivo, m in motivos.items():
-        print(f"       - {motivo:<30} {m.sum():>4} frames")
+        print(f"       - {motivo:<34} {m.sum():>4} frames")
 
     #Agrupamos los frames malos consecutivos en episodios, con el motivo mas frecuente de cada uno
     episodios, i = [], 0
@@ -882,13 +922,16 @@ def consigna_7_artefactos(config):
         while j < len(ok) and ok[j] == ok[i]:
             j += 1
         if not ok[i]:
-            episodios.append((t[i], t[j - 1], j - i, max(motivos, key=lambda m: motivos[m][i:j].sum())))
+            reales = [m for m in motivos if m not in ('margen alrededor de un artefacto', 'tramo corto entre artefactos')]
+            conteo = {m: motivos[m][i:j].sum() for m in reales}
+            principal = max(conteo, key=conteo.get) if max(conteo.values()) > 0 else max(motivos, key=lambda m: motivos[m][i:j].sum())
+            episodios.append((t[i], t[j - 1], j - i, principal))
         i = j
     print(f"     Episodios de artefacto ({len(episodios)}):")
     for ini, fin, n, motivo in episodios:
         print(f"       {ini:6.2f} s - {fin:6.2f} s  ({n:>3} frames)  {motivo}")
     print("     Método: los frames marcados se descartan y se reemplazan por interpolación lineal entre los")
-    print("     frames confiables vecinos; luego la curva se suaviza con un filtro Savitzky-Golay de ~0.3 s.")
+    print("     frames confiables vecinos; luego la curva se filtra con una mediana y un Savitzky-Golay (~0.3 s cada uno).")
 
     fig, ax = plt.subplots(figsize=(12, 5))
     fig.canvas.manager.set_window_title("Parte 3.2 - Consigna 4: Artefactos")
