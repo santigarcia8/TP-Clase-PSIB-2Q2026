@@ -14,6 +14,16 @@ NIVELES_GRIS = 64                 #niveles a los que se cuantiza la ROI (la guia
 CARPETA_RESULTADOS = "resultados" #carpeta donde se guardan los CSV del modulo
 CANALES = ('R', 'G', 'B')
 COLORES = {'R': 'tab:red', 'G': 'tab:green', 'B': 'tab:blue'}
+#Columnas fijas de parametros_registros.csv (mismo orden siempre, para cualquier video)
+COLUMNAS_PARAMETROS = ['video', 'tipo', 't_estimulo_s', 'latencia_s', 'diametro_basal_px', 'diametro_extremo_px',
+                       't_extremo_s', 'amplitud_diametro_px', 'amplitud_area_px',
+                       'vel_contraccion_px_s', 'vel_redilatacion_px_s',
+                       #equivalentes en mm (quedan vacios si no se definio la escala MM_POR_PX)
+                       'diametro_basal_mm', 'amplitud_diametro_mm', 'amplitud_area_mm2',
+                       'vel_contraccion_mm_s', 'vel_redilatacion_mm_s']
+#Escala espacial: milimetros por pixel. Se obtiene con calibrar_escala.py (referencia de tamano conocido en la imagen)
+#y se puede pisar por video con config['mm_por_px']. None = no se informan columnas en mm.
+MM_POR_PX = None
 
 
 # =============================================================================
@@ -425,29 +435,47 @@ def medir_video_frame_a_frame(video_path, roi):
             'centroide_x': datos[:, 3], 'centroide_y': datos[:, 4], 'encontrada': ~np.isnan(datos[:, 0])}
 
 
-def obtener_medicion(config):
+def obtener_medicion(config, exportar=True):
     #Mide el video una sola vez y lo reutiliza en las 4 consignas de la 3.2 (se vuelve a medir si cambia la ROI)
+    #Al medir por primera vez se escriben solos los CSV de salida (curva + parametros), sin pasar por ninguna consigna
     clave = (config['video_path'], tuple(config['roi']) if config['roi'] else None)
     if config.get('medicion_m3', {}).get('clave') != clave:
         print("     Midiendo la pupila en todos los frames del video...")
         config['medicion_m3'] = medir_video_frame_a_frame(config['video_path'], config['roi'])
         config['medicion_m3']['clave'] = clave
+        if exportar:
+            try:
+                ruta_curva, ruta_param, _ = exportar_csv(config)
+                print(f"     CSV generados: {ruta_curva} | {ruta_param}")
+            except Exception as err: #un problema al exportar no debe cortar el menu
+                print(f"[AVISO] No se pudieron generar los CSV automaticamente: {err}")
     return config['medicion_m3']
 
 
-def guardar_curva_csv(medicion, nombre_video, d_limpia=None, a_limpia=None):
-    #Salida estandarizada: curva frame a frame (cruda y, si ya se calculo, sin artefactos) en un CSV
+def _fmt(x, dec):
+    #Numero con 'dec' decimales; si es NaN/inf se deja la celda vacia (en vez del texto 'nan')
+    return "" if x is None or not np.isfinite(x) else f"{x:.{dec}f}"
+
+
+def guardar_curva_csv(medicion, nombre_video, d_limpia=None, a_limpia=None, mm_por_px=None):
+    #Salida estandarizada: curva frame a frame con SIEMPRE las mismas columnas (cruda + sin artefactos)
     os.makedirs(CARPETA_RESULTADOS, exist_ok=True)
     ruta = os.path.join(CARPETA_RESULTADOS, f"{nombre_video}_curva_frame_a_frame.csv")
-    ok = frames_confiables(medicion)
+    if d_limpia is None or a_limpia is None:
+        d_limpia, a_limpia, ok = limpiar_curva(medicion)
+    else:
+        ok = frames_confiables(medicion)
     with open(ruta, 'w', newline='', encoding='utf-8') as f:
         e = csv.writer(f)
-        e.writerow(['frame', 'tiempo_s', 'area_px', 'diametro_px', 'circularidad', 'frame_confiable']
-                   + (['area_sin_artefactos_px', 'diametro_sin_artefactos_px'] if d_limpia is not None else []))
+        e.writerow(['frame', 'tiempo_s', 'area_px', 'diametro_px', 'circularidad', 'frame_confiable',
+                    'area_sin_artefactos_px', 'diametro_sin_artefactos_px',
+                    'area_sin_artefactos_mm2', 'diametro_sin_artefactos_mm'])
         for k in range(len(medicion['frame'])):
-            e.writerow([k, f"{medicion['tiempo_s'][k]:.4f}", f"{medicion['area_px'][k]:.1f}",
-                        f"{medicion['diametro_px'][k]:.3f}", f"{medicion['circularidad'][k]:.4f}", int(ok[k])]
-                       + ([f"{a_limpia[k]:.1f}", f"{d_limpia[k]:.3f}"] if d_limpia is not None else []))
+            e.writerow([k, _fmt(medicion['tiempo_s'][k], 4), _fmt(medicion['area_px'][k], 1),
+                        _fmt(medicion['diametro_px'][k], 3), _fmt(medicion['circularidad'][k], 4), int(ok[k]),
+                        _fmt(a_limpia[k], 1), _fmt(d_limpia[k], 3),
+                        _fmt(a_limpia[k] * mm_por_px ** 2, 3) if mm_por_px else "",
+                        _fmt(d_limpia[k] * mm_por_px, 3) if mm_por_px else ""])
     return ruta
 
 
@@ -627,7 +655,13 @@ def limpiar_curva(medicion):
     #sin aplanar la contraccion rapida
     ok = frames_confiables(medicion)
     t = medicion['tiempo_s']
+    if ok.sum() < 2: #sin frames confiables no hay nada para interpolar: se usan todos los frames que tengan medicion
+        ok = medicion['encontrada'].copy()
+    if ok.sum() < 2:
+        vacia = np.full(len(t), np.nan)
+        return [vacia, vacia.copy(), ok]
     ventana = int(0.3 * medicion['fps']) // 2 * 2 + 1
+    ventana = max(3, min(ventana, (len(t) // 2) * 2 - 1)) #impar, > orden del polinomio y <= largo de la curva
     return [savgol_filter(np.interp(t, t[ok], medicion[c][ok]), ventana, 2) for c in ('diametro_px', 'area_px')] + [ok]
 
 
@@ -653,6 +687,9 @@ def parametros_fisiologicos(t, d, a, t_est):
     basal = (t >= t_est - 1) & (t < t_est)
     if basal.sum() < 3:
         basal = (t >= t_est) & (t < t_est + 0.2)
+    if basal.sum() == 0 or not np.isfinite(d).any() or not ((t >= t_est) & (t <= t_est + 5)).any():
+        #no se puede calcular (curva vacia o estimulo fuera del video): fila con celdas vacias, no un error
+        return {**dict.fromkeys(COLUMNAS_PARAMETROS[1:], np.nan), 'tipo': 'sin dato', 't_estimulo_s': t_est}
     d_basal, a_basal = d[basal].mean(), a[basal].mean()
     #3.b) Amplitud: diferencia entre el basal y el extremo de la respuesta en los 5 s posteriores
     #     (si la pupila se achica es una contraccion -registro A-, si se agranda una redilatacion -registro B-)
@@ -681,13 +718,105 @@ def guardar_parametros(nombre_video, p):
     filas = []
     if os.path.exists(ruta):
         with open(ruta, newline='', encoding='utf-8') as f:
-            filas = [r for r in csv.DictReader(f) if r['video'] != nombre_video]
-    filas.append({'video': nombre_video, **{k: (f"{v:.4f}" if isinstance(v, float) else v) for k, v in p.items()}})
+            filas = [r for r in csv.DictReader(f) if r.get('video') != nombre_video]
+    filas.append({'video': nombre_video,
+                  **{k: (_fmt(float(v), 4) if isinstance(v, (int, float, np.floating)) else v) for k, v in p.items()}})
     with open(ruta, 'w', newline='', encoding='utf-8') as f:
-        e = csv.DictWriter(f, fieldnames=list(filas[-1].keys()))
+        e = csv.DictWriter(f, fieldnames=COLUMNAS_PARAMETROS, restval='', extrasaction='ignore') #columnas fijas
         e.writeheader()
         e.writerows(filas)
     return ruta, filas
+
+
+def agregar_mm(p, mm_por_px):
+    #Suma al dict de parametros las versiones en mm (diametro y velocidades x escala, area x escala^2); vacias si no hay escala
+    e = mm_por_px
+    conv = lambda v, k: v * k if e and v is not None and np.isfinite(v) else np.nan
+    return {**p, 'diametro_basal_mm': conv(p['diametro_basal_px'], e), 'amplitud_diametro_mm': conv(p['amplitud_diametro_px'], e),
+            'amplitud_area_mm2': conv(p['amplitud_area_px'], e ** 2 if e else 0),
+            'vel_contraccion_mm_s': conv(p['vel_contraccion_px_s'], e), 'vel_redilatacion_mm_s': conv(p['vel_redilatacion_px_s'], e)}
+
+
+def ruta_escala(config):
+    nombre = os.path.splitext(os.path.basename(config['video_path']))[0]
+    return os.path.join(CARPETA_RESULTADOS, f"{nombre}_escala_mm_por_px.txt")
+
+
+def escala_mm(config):
+    #Escala (mm por pixel) vigente: la de esta sesion, o la guardada de una calibracion anterior de este video, o None
+    if config.get('mm_por_px'):
+        return config['mm_por_px']
+    ruta = ruta_escala(config)
+    if os.path.exists(ruta):
+        try:
+            config['mm_por_px'] = float(open(ruta, encoding='utf-8').read().strip())
+            return config['mm_por_px']
+        except ValueError:
+            pass
+    return MM_POR_PX
+
+
+def calibrar_escala(config):
+    #Opcion 8 del menu: con un objeto de medida conocida en la imagen (ej: un chicle) se calcula cuantos mm mide un pixel.
+    #Se hacen 2 clicks en los extremos del objeto, se escribe su medida real y los CSV se regeneran solos con columnas en mm.
+    print("\n CALIBRACION DE ESCALA (px -> mm)")
+    print("     El objeto tiene que estar a la misma distancia de la camara que el ojo.")
+    resp = input(f"     Frame donde se vea bien el chicle [ENTER = frame {config.get('frame_idx', 0)}]: ").strip()
+    fr = int(resp) if resp.isdigit() else config.get('frame_idx', 0)
+    frame_rgb, _ = cargar_frame_y_roi(config['video_path'], fr, None)
+    h, w = frame_rgb.shape[:2]
+    escala = min(1.0, 1000.0 / max(h, w))
+    base = cv2.resize(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR), (int(w * escala), int(h * escala)))
+    puntos = []
+    titulo = "Calibracion: click en los 2 extremos del chicle | r = reiniciar | ENTER = aceptar | ESC = cancelar"
+    cv2.namedWindow(titulo)
+    cv2.setMouseCallback(titulo, lambda ev, x, y, *_: puntos.append((x / escala, y / escala))
+                         if ev == cv2.EVENT_LBUTTONDOWN and len(puntos) < 2 else None)
+    while True:
+        vista = base.copy()
+        for px, py in puntos:
+            cv2.circle(vista, (int(px * escala), int(py * escala)), 4, (0, 255, 0), -1)
+        if len(puntos) == 2:
+            cv2.line(vista, *[(int(px * escala), int(py * escala)) for px, py in puntos], (0, 255, 255), 1)
+        cv2.imshow(titulo, vista)
+        tecla = cv2.waitKey(20) & 0xFF
+        if tecla in (13, 10) and len(puntos) == 2:
+            break
+        if tecla == ord('r'):
+            puntos.clear()
+        if tecla == 27:
+            cv2.destroyWindow(titulo)
+            print("     Calibracion cancelada.")
+            return
+    cv2.destroyWindow(titulo)
+    largo_px = float(np.hypot(puntos[1][0] - puntos[0][0], puntos[1][1] - puntos[0][1]))
+    try:
+        largo_mm = float(input("     Medida REAL de ese tramo en mm (ej: 70): ").strip().replace(',', '.'))
+        assert largo_mm > 0 and largo_px > 0
+    except (ValueError, AssertionError):
+        print("     [ERROR] Medida invalida. Calibracion cancelada.")
+        return
+    config['mm_por_px'] = largo_mm / largo_px
+    os.makedirs(CARPETA_RESULTADOS, exist_ok=True)
+    with open(ruta_escala(config), 'w', encoding='utf-8') as f:
+        f.write(f"{config['mm_por_px']:.6f}")
+    print(f"     {largo_px:.1f} px = {largo_mm} mm  ->  1 px = {config['mm_por_px']:.5f} mm (guardado para este video)")
+    ruta_curva, ruta_param, _ = exportar_csv(config)
+    print(f"     CSV regenerados con columnas en mm: {ruta_curva} | {ruta_param}")
+
+
+def exportar_csv(config, t_est=None):
+    #Genera SIN preguntar nada los dos CSV de salida estandarizada (curva frame a frame + parametros fisiologicos)
+    medicion = obtener_medicion(config, exportar=False)
+    nombre_video = os.path.splitext(os.path.basename(config['video_path']))[0]
+    d, a, ok = limpiar_curva(medicion)
+    if t_est is None:
+        t_est, _ = detectar_estimulo(config['video_path'], ok, medicion['fps'])
+    e = escala_mm(config)
+    p = agregar_mm(parametros_fisiologicos(medicion['tiempo_s'], d, a, t_est), e)
+    ruta_curva = guardar_curva_csv(medicion, nombre_video, d, a, e)
+    ruta_param, _ = guardar_parametros(nombre_video, p)
+    return ruta_curva, ruta_param, p
 
 
 def consigna_6_parametros(config):
@@ -701,14 +830,15 @@ def consigna_6_parametros(config):
     if resp:
         t_est = float(resp.replace(',', '.'))
 
-    p = parametros_fisiologicos(t, d, a, t_est)
+    e_mm = escala_mm(config)
+    p = agregar_mm(parametros_fisiologicos(t, d, a, t_est), e_mm)
     print(f"     Tipo de respuesta: {p['tipo']}")
     print(f"3.a) Diámetro basal = {p['diametro_basal_px']:.1f} px")
     print(f"3.b) Amplitud = {p['amplitud_diametro_px']:.1f} px (diámetro) | {p['amplitud_area_px']:.0f} px² (área)")
     print(f"3.c) Tiempo de latencia = {1000 * p['latencia_s']:.0f} ms")
     print(f"3.d) Velocidad de contracción = {p['vel_contraccion_px_s']:.1f} px/s | redilatación = {p['vel_redilatacion_px_s']:.1f} px/s")
     ruta, filas = guardar_parametros(nombre_video, p)
-    print(f"     Curva guardada en: {guardar_curva_csv(medicion, nombre_video, d, a)} | Parámetros en: {ruta}")
+    print(f"     Curva guardada en: {guardar_curva_csv(medicion, nombre_video, d, a, e_mm)} | Parámetros en: {ruta}")
     filas = [f for f in filas if f['tipo'] == p['tipo']] #variabilidad solo entre registros del mismo tipo
     if len(filas) >= 2:
         print(f"3.e) Variabilidad entre {len(filas)} registros {p['tipo']} (media ± desvío):")
@@ -795,6 +925,7 @@ def ejecutar_modulo_3(config):
         "5": ("Parte 3.2 - Consigna 2: Curva temporal D(t) y A(t)", consigna_5_curva),
         "6": ("Parte 3.2 - Consigna 3: Parámetros fisiológicos", consigna_6_parametros),
         "7": ("Parte 3.2 - Consigna 4: Fuentes de artefactos y método de filtrado", consigna_7_artefactos),
+        "8": ("Calibrar escala px -> mm (con el chicle)", calibrar_escala),
     }
     while True:
         print("\n--------------------------------------------------")

@@ -1,0 +1,2 @@
+video,tipo,t_estimulo_s,latencia_s,diametro_basal_px,diametro_extremo_px,t_extremo_s,amplitud_diametro_px,amplitud_area_px,vel_contraccion_px_s,vel_redilatacion_px_s,diametro_basal_mm,amplitud_diametro_mm,amplitud_area_mm2,vel_contraccion_mm_s,vel_redilatacion_mm_s
+video_ojo_oli,A (contraccion),0.4344,0.1002,28.0137,17.2501,1.6706,10.7636,382.6700,30.5806,10.3428,3.5504,1.3642,6.1466,3.8757,1.3108
